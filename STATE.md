@@ -45,3 +45,6 @@ This is a small, coherent project — **NOT split into sub-projects**. One bound
 | P07 | Tests + verification (CI + verification.md) | ✅ DONE | (verifier subagent) |
 | P08 | UX: search-in-progress feedback (spinner, status, abort, perf banner) | ✅ DONE | feature/search-feedback (merged in #3) |
 | P09 | FTS5 sidecar index + search backend (fts.py + search.py + perf-notes.md) | ✅ IMPL-COMPLETE | feature/fts5-search |
+| P10 | Account column: per-account JSONL discovery (accounts.py + db/search/server wiring) | ✅ IMPL-COMPLETE | feature/accounts-and-phrase |
+| P11 | Exact-phrase search: structured terms, `q_exact=` API, `match_kind` ranking | ✅ IMPL-COMPLETE | feature/accounts-and-phrase |
+| P12 | Frontend: account badge + filter, exact-phrase toggle, match-kind row accent | ✅ IMPL-COMPLETE | feature/accounts-and-phrase |

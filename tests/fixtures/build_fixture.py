@@ -201,6 +201,29 @@ def build_search_fixture(path: str | None = None) -> str:
              ]),
              "2026-05-14T18:00:00", "2026-05-14T18:00:00", "tD"),
         ]
+        # Extra session for phrase-search tests: sE contains the exact phrase
+        # "migration of the 684 sites" in an assistant text block. We give it
+        # a slightly older updated_at than sB so we can verify that, when sE
+        # matches via exact-phrase and sB matches via AND-of-words, sE is
+        # ranked ABOVE sB even though sB is "newer".
+        msgs.append((
+            "mE1", "sE", "assistant",
+            _assistant_text(
+                "We need to plan the migration of the 684 sites this quarter. "
+                "Happy cat noises are unrelated."
+            ),
+            "2026-05-13T18:00:00", "2026-05-13T18:00:00", "tE",
+        ))
+        con.executemany(
+            "INSERT INTO sessions (id, title, workspace_id, model, agent_type,"
+            " created_at, updated_at, last_user_message_at, context_used_percent,"
+            " context_token_count, is_hidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(
+                "sE", "Phrase test", "ws-x", "sonnet", "claude",
+                "2026-05-11T10:00:00", "2026-05-13T18:30:00",
+                "2026-05-13T18:25:00", None, None, 0,
+            )],
+        )
         con.executemany(
             """INSERT INTO session_messages
             (id, session_id, role, content, created_at, sent_at, turn_id)
