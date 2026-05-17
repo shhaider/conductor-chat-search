@@ -97,6 +97,36 @@ def get_session_messages(con: sqlite3.Connection, session_id: str) -> list[dict[
     return [dict(r) for r in rows]
 
 
+def get_messages_by_ids(
+    con: sqlite3.Connection, session_id: str, message_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Return the subset of messages in ``session_id`` whose id is in
+    ``message_ids``, ordered by sent_at ASC, rowid ASC.
+
+    Used by the FTS path to fetch ONLY the messages that the FTS index
+    flagged as containing a term — avoiding a full per-session message
+    read in pass-2 confirmation.
+
+    Chunked IN clauses keep us under SQLite's ~999-param default ceiling.
+    Empty ``message_ids`` returns an empty list without touching the DB.
+    """
+    if not message_ids:
+        return []
+    CHUNK = 800
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(message_ids), CHUNK):
+        chunk = message_ids[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        sql = (
+            "SELECT * FROM session_messages "
+            f"WHERE session_id = ? AND id IN ({placeholders}) "
+            "ORDER BY sent_at ASC, rowid ASC"
+        )
+        rows = con.execute(sql, [session_id, *chunk]).fetchall()
+        out.extend(dict(r) for r in rows)
+    return out
+
+
 def get_schema_version(con: sqlite3.Connection) -> str | None:
     """Return the latest version_id from _sqlx_migrations, or None if the table is absent."""
     try:

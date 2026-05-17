@@ -27,7 +27,27 @@ def running_server():
     original_default = _export.DEFAULT_OUT_DIR
     _export.DEFAULT_OUT_DIR = out_dir
 
-    httpd = server.make_server(host="127.0.0.1", port=0, db_path=db_path)
+    # Use a temp FTS index so tests never touch the operator's real sidecar.
+    # Build it up-front so the search endpoint exercises the FTS path.
+    from conductor_chat import db as _db, fts as _fts
+    fts_dir = tempfile.mkdtemp(prefix="cchat-server-test-fts-")
+    fts_path = os.path.join(fts_dir, "fts.db")
+    if _fts.has_fts5():
+        src = _db.open_ro(db_path)
+        try:
+            fcon = _fts.open_fts(fts_path)
+            try:
+                _fts.build_or_sync(fcon, src, progress_stream=None)
+            finally:
+                fcon.close()
+        finally:
+            src.close()
+    else:
+        fts_path = None  # type: ignore[assignment]
+
+    httpd = server.make_server(
+        host="127.0.0.1", port=0, db_path=db_path, fts_path=fts_path
+    )
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -41,6 +61,7 @@ def running_server():
         thread.join(timeout=5)
         _export.DEFAULT_OUT_DIR = original_default
         shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(fts_dir, ignore_errors=True)
         try:
             os.remove(db_path)
         except OSError:
