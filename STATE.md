@@ -43,4 +43,5 @@ This is a small, coherent project — **NOT split into sub-projects**. One bound
 | P05 | Server + launch script (server.py + run.sh) | ✅ DONE | (impl subagent) |
 | P06 | Shared extraction module (render.py) | ✅ DONE | (impl subagent) |
 | P07 | Tests + verification (CI + verification.md) | ✅ DONE | (verifier subagent) |
-| P08 | UX: search-in-progress feedback (spinner, status, abort, perf banner) | ✅ IMPL-COMPLETE | feature/search-feedback |
+| P08 | UX: search-in-progress feedback (spinner, status, abort, perf banner) | ✅ DONE | feature/search-feedback (merged in #3) |
+| P09 | FTS5 sidecar index + search backend (fts.py + search.py + perf-notes.md) | ✅ IMPL-COMPLETE | feature/fts5-search |

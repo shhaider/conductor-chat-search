@@ -59,12 +59,19 @@ def search(
             s["snippets"] = []
         return sessions
 
-    # Pass 1: candidate session_ids that contain each term.
+    # Pass 1: for each term, find the candidate session_ids that contain it.
+    # When using FTS we also collect the hit message_ids so pass 2 can fetch
+    # only those messages instead of every message in every candidate session.
     candidate_sets: list[set[str]] = []
+    # Per-term mapping: session_id -> set of message_ids that FTS5 says hit
+    # this term inside that session. None means "FTS not used; pass 2 must
+    # scan all messages in the session" (LIKE fallback path).
+    per_term_msg_hits: list[dict[str, set[str]] | None] = []
+
     for term in normalised_terms:
-        candidate_sets.append(
-            _candidates_for_term(con, term, workspace_id, fts_con=fts_con)
-        )
+        sids, hit_map = _candidates_for_term(con, term, workspace_id, fts_con=fts_con)
+        candidate_sets.append(sids)
+        per_term_msg_hits.append(hit_map)
 
     candidate_ids: set[str] = (
         set.intersection(*candidate_sets) if candidate_sets else set()
@@ -72,8 +79,11 @@ def search(
     if not candidate_ids:
         return []
 
-    # Pass 2: for each candidate session, fetch messages and confirm each term
-    # appears in at least one text block. Build snippets while we're at it.
+    # Pass 2: for each candidate session, fetch the relevant messages and
+    # confirm each term appears in at least one text block. Build snippets
+    # while we're at it. When FTS provided hit message_ids we fetch only
+    # those (typically a handful); otherwise we fall back to fetching all
+    # messages in the session (LIKE path).
     all_sessions = db.list_sessions(con, limit=max(limit, len(candidate_ids)))
     session_index = {s["session_id"]: s for s in all_sessions}
 
@@ -83,7 +93,22 @@ def search(
             continue
         if workspace_id and session_index[sid]["workspace_id"] != workspace_id:
             continue
-        messages = db.get_session_messages(con, sid)
+
+        # Collect the message_ids we need to fetch for this session: the union
+        # of FTS hits across all terms. If any term had no FTS map (LIKE
+        # fallback), we fetch all messages in the session.
+        msg_ids_needed: set[str] | None = set()
+        for hit_map in per_term_msg_hits:
+            if hit_map is None:
+                msg_ids_needed = None
+                break
+            msg_ids_needed.update(hit_map.get(sid, set()))
+
+        if msg_ids_needed is None:
+            messages = db.get_session_messages(con, sid)
+        else:
+            messages = db.get_messages_by_ids(con, sid, list(msg_ids_needed))
+
         confirmed_snippets: list[dict[str, Any]] = []
         all_terms_confirmed = True
         for term in normalised_terms:
@@ -116,12 +141,18 @@ def _candidates_for_term(
     term: str,
     workspace_id: str | None,
     fts_con: sqlite3.Connection | None,
-) -> set[str]:
-    """Return session_ids whose any message contains the term, via FTS5 if
-    available, else SQL LIKE."""
+) -> tuple[set[str], dict[str, set[str]] | None]:
+    """Return ``(session_ids, msg_hit_map)`` for one term.
+
+    - ``session_ids``: set of session_ids whose any message contains the term.
+    - ``msg_hit_map``: when FTS is used, ``{session_id -> {message_id, ...}}``
+      so pass 2 can fetch only the messages that actually matched. ``None``
+      means the caller fell back to LIKE and pass 2 must scan every message
+      in each candidate session.
+    """
     if fts_con is not None:
         return _candidates_via_fts(con, fts_con, term, workspace_id)
-    return _candidates_via_like(con, term, workspace_id)
+    return (_candidates_via_like(con, term, workspace_id), None)
 
 
 def _candidates_via_fts(
@@ -129,20 +160,25 @@ def _candidates_via_fts(
     fts_con: sqlite3.Connection,
     term: str,
     workspace_id: str | None,
-) -> set[str]:
-    """Pass-1 via FTS5 MATCH. Returns session_ids whose any message_id is in
-    the FTS hit set AND (optionally) belongs to the given workspace."""
+) -> tuple[set[str], dict[str, set[str]]]:
+    """Pass-1 via FTS5 MATCH. Returns ``(session_ids, msg_hit_map)`` where
+    ``msg_hit_map[session_id]`` is the set of message_ids that matched.
+
+    The workspace filter is applied at the SQL join layer so we never include
+    sessions outside the active workspace.
+    """
     hit_message_ids = fts.search_term(fts_con, term)
     if not hit_message_ids:
-        return set()
+        return (set(), {})
     # Resolve message_id -> session_id from conductor.db. Chunked IN to stay
     # well under SQLite's ~999-param default ceiling.
     session_ids: set[str] = set()
+    msg_hit_map: dict[str, set[str]] = {}
     ids = list(hit_message_ids)
     CHUNK = 800
     if workspace_id:
         sql = (
-            "SELECT DISTINCT m.session_id "
+            "SELECT m.session_id, m.id "
             "FROM session_messages m "
             "JOIN sessions s ON s.id = m.session_id "
             "WHERE s.is_hidden = 0 "
@@ -151,7 +187,7 @@ def _candidates_via_fts(
         )
     else:
         sql = (
-            "SELECT DISTINCT m.session_id "
+            "SELECT m.session_id, m.id "
             "FROM session_messages m "
             "JOIN sessions s ON s.id = m.session_id "
             "WHERE s.is_hidden = 0 "
@@ -167,8 +203,12 @@ def _candidates_via_fts(
         rows = con.execute(
             sql.format(placeholders=placeholders), params
         ).fetchall()
-        session_ids.update(r[0] for r in rows)
-    return session_ids
+        for row in rows:
+            sid = row[0]
+            mid = row[1]
+            session_ids.add(sid)
+            msg_hit_map.setdefault(sid, set()).add(mid)
+    return (session_ids, msg_hit_map)
 
 
 def _candidates_via_like(
