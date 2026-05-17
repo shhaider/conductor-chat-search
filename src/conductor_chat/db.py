@@ -29,12 +29,22 @@ def open_ro(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return con
 
 
-def list_sessions(con: sqlite3.Connection, limit: int = 500) -> list[dict[str, Any]]:
+def list_sessions(
+    con: sqlite3.Connection,
+    limit: int = 500,
+    account_index: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Return non-hidden sessions ordered by updated_at DESC.
 
     Each dict carries: session_id, title, workspace_id, workspace_name, model,
     agent_type, created_at, updated_at, last_user_message_at,
-    context_used_percent, context_token_count, message_count.
+    context_used_percent, context_token_count, message_count, account.
+
+    ``account`` is the Claude Code account directory whose ``projects/`` tree
+    holds the resumable JSONL for this session id, or None if no account
+    holds resume state (an "orphaned" session — chat content is intact but
+    Claude Code cannot resume it). When ``account_index`` is not supplied,
+    the field is set to None on every row.
     """
     rows = con.execute(
         """
@@ -59,7 +69,14 @@ def list_sessions(con: sqlite3.Connection, limit: int = 500) -> list[dict[str, A
         """,
         (limit,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    # Decorate with the account field (None if no index provided).
+    for r in result:
+        sid = r.get("session_id")
+        r["account"] = (
+            account_index.get(sid) if (account_index and sid is not None) else None
+        )
+    return result
 
 
 def list_workspaces(con: sqlite3.Connection) -> list[dict[str, Any]]:

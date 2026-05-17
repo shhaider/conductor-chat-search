@@ -10,6 +10,18 @@ assistant prose, not tool inputs, tool results, or thinking blocks. This is
 kept as defense-in-depth: FTS5 tokenisation can disagree with substring match
 at hyphens, dots, and other punctuation, and we want the on-screen snippet
 to actually contain the term.
+
+Terms come in two flavours:
+
+  - **AND terms** (``exact=False``) — current default behaviour. Each term
+    is one word/token; multiple terms are AND-joined.
+  - **Exact-phrase terms** (``exact=True``) — the value is a full phrase,
+    matched as a contiguous substring. The snippet wraps the WHOLE phrase
+    in ``«…»`` (a side-effect of ``_make_snippet`` using ``len(term)``).
+
+Each result row carries ``match_kind``: ``"exact"`` if at least one term in
+the query was an exact-phrase match, else ``"and"``. Exact rows are sorted
+above AND rows in the returned list.
 """
 
 from __future__ import annotations
@@ -24,39 +36,73 @@ from . import db, fts
 SNIPPET_RADIUS = 80
 
 
+def _normalise_terms(terms: list[Any]) -> list[dict[str, Any]]:
+    """Coerce mixed ``list[str] | list[dict]`` into the canonical structured form.
+
+    A bare string is treated as an AND term (``exact=False``). A dict is
+    expected to carry ``value`` (str) and ``exact`` (bool). Empty / whitespace
+    values are stripped.
+    """
+    out: list[dict[str, Any]] = []
+    for t in terms:
+        if isinstance(t, str):
+            value = t.strip()
+            if not value:
+                continue
+            out.append({"value": value, "exact": False})
+        elif isinstance(t, dict):
+            value = str(t.get("value") or "").strip()
+            if not value:
+                continue
+            out.append({"value": value, "exact": bool(t.get("exact", False))})
+        # silently ignore unknown shapes
+    return out
+
+
 def search(
     con: sqlite3.Connection,
-    terms: list[str],
+    terms: list[Any],
     workspace_id: str | None = None,
     limit: int = 500,
     fts_con: sqlite3.Connection | None = None,
+    account_index: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """AND-search across user+assistant text content.
 
-    Returns a list of session dicts (same fields as ``db.list_sessions``) with an
-    extra ``snippets`` key: a list of {term, text, message_id, role, sent_at}
-    items — one snippet per matched term per session. The matched substring in
-    ``text`` is wrapped in ``«...»`` for the UI to highlight.
+    Returns a list of session dicts (same fields as ``db.list_sessions``) with
+    extra ``snippets``, ``match_kind``, and ``account`` keys.
+
+    ``snippets`` is a list of {term, text, message_id, role, sent_at, exact}
+    items — one per term per session. The matched substring in ``text`` is
+    wrapped in ``«...»`` for the UI to highlight.
 
     Semantics:
       - Empty terms list -> identical to ``db.list_sessions`` (no filtering).
       - All terms must match somewhere in the session (AND).
       - Term match is case-insensitive substring (LIKE fallback) or FTS5
-        tokenised phrase (when ``fts_con`` is provided).
+        phrase (when ``fts_con`` is provided). Multi-word exact-phrase terms
+        rely on FTS5's native phrase-query syntax.
       - Match must be inside a content item with ``type=="text"``; tool inputs,
         tool results, and thinking blocks do NOT count.
       - If workspace_id is set, restrict to that workspace.
       - ``fts_con``: an open connection to the sidecar FTS index. When provided,
         pass-1 uses FTS5 MATCH instead of LIKE. None means LIKE fallback.
-    """
-    normalised_terms = [t for t in (s.strip() for s in terms) if t]
+      - ``account_index``: dict mapping ``session_id -> account_name``. When
+        provided, each returned row's ``account`` field is populated.
 
-    if not normalised_terms:
-        sessions = db.list_sessions(con, limit=limit)
+    Result ordering:
+      1. ``match_kind == "exact"`` rows first, then ``"and"`` rows.
+      2. Within each group, ``updated_at DESC`` (list_sessions order).
+    """
+    structured = _normalise_terms(terms)
+
+    if not structured:
+        sessions = db.list_sessions(con, limit=limit, account_index=account_index)
         if workspace_id:
             sessions = [s for s in sessions if s["workspace_id"] == workspace_id]
         for s in sessions:
             s["snippets"] = []
+            s["match_kind"] = "and"
         return sessions
 
     # Pass 1: for each term, find the candidate session_ids that contain it.
@@ -68,8 +114,10 @@ def search(
     # scan all messages in the session" (LIKE fallback path).
     per_term_msg_hits: list[dict[str, set[str]] | None] = []
 
-    for term in normalised_terms:
-        sids, hit_map = _candidates_for_term(con, term, workspace_id, fts_con=fts_con)
+    for term in structured:
+        sids, hit_map = _candidates_for_term(
+            con, term["value"], workspace_id, fts_con=fts_con
+        )
         candidate_sets.append(sids)
         per_term_msg_hits.append(hit_map)
 
@@ -84,8 +132,14 @@ def search(
     # while we're at it. When FTS provided hit message_ids we fetch only
     # those (typically a handful); otherwise we fall back to fetching all
     # messages in the session (LIKE path).
-    all_sessions = db.list_sessions(con, limit=max(limit, len(candidate_ids)))
+    all_sessions = db.list_sessions(
+        con,
+        limit=max(limit, len(candidate_ids)),
+        account_index=account_index,
+    )
     session_index = {s["session_id"]: s for s in all_sessions}
+
+    has_any_exact = any(t["exact"] for t in structured)
 
     results: list[dict[str, Any]] = []
     for sid in candidate_ids:
@@ -111,11 +165,12 @@ def search(
 
         confirmed_snippets: list[dict[str, Any]] = []
         all_terms_confirmed = True
-        for term in normalised_terms:
+        for term in structured:
             term_snippet: dict[str, Any] | None = None
             for msg in messages:
-                ok, snippet = _confirm_term_in_text_blocks(msg, term)
+                ok, snippet = _confirm_term_in_text_blocks(msg, term["value"])
                 if ok:
+                    snippet["exact"] = term["exact"]
                     term_snippet = snippet
                     break
             if term_snippet is None:
@@ -125,11 +180,18 @@ def search(
         if all_terms_confirmed:
             row = dict(session_index[sid])
             row["snippets"] = confirmed_snippets
+            row["match_kind"] = "exact" if has_any_exact else "and"
             results.append(row)
 
-    # Preserve list_sessions ordering (updated_at DESC).
+    # Preserve list_sessions ordering (updated_at DESC) within each match-kind
+    # group; exact-phrase results come first.
     sid_to_order = {s["session_id"]: i for i, s in enumerate(all_sessions)}
-    results.sort(key=lambda r: sid_to_order.get(r["session_id"], 1_000_000))
+    results.sort(
+        key=lambda r: (
+            0 if r["match_kind"] == "exact" else 1,
+            sid_to_order.get(r["session_id"], 1_000_000),
+        )
+    )
     return results[:limit]
 
 

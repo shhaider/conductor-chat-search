@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import db, export, fts, search
+from . import accounts, db, export, fts, search
 
 STATIC_DIR = Path(__file__).parent / "static"
 ALLOWED_STATIC: set[str] = {"index.html"}
@@ -39,6 +39,7 @@ class Handler(BaseHTTPRequestHandler):
     # injected at server construction time
     db_path: str = db.DEFAULT_DB_PATH
     fts_path: str | None = fts.DEFAULT_FTS_PATH  # None = disable FTS (LIKE fallback)
+    account_index: dict[str, str] = {}  # {session_id: account_name}; empty = unindexed
 
     # ---- routing ----
 
@@ -102,7 +103,11 @@ class Handler(BaseHTTPRequestHandler):
         warning = None
         if ver and not str(ver).startswith(KNOWN_GOOD_SCHEMA_PREFIX):
             warning = f"Untested schema version: {ver}"
-        body: dict[str, Any] = {"ok": True, "schema_version": ver}
+        body: dict[str, Any] = {
+            "ok": True,
+            "schema_version": ver,
+            "accounts_indexed": len(self.account_index),
+        }
         if warning:
             body["schema_warning"] = warning
         self._send_json(200, body)
@@ -115,9 +120,16 @@ class Handler(BaseHTTPRequestHandler):
             con.close()
 
     def _handle_sessions(self, qs: dict[str, list[str]]) -> None:
-        terms = [t for t in qs.get("q", []) if t]
+        and_values = [t for t in qs.get("q", []) if t]
+        exact_values = [t for t in qs.get("q_exact", []) if t]
+        terms: list[dict[str, Any]] = (
+            [{"value": v, "exact": False} for v in and_values]
+            + [{"value": v, "exact": True} for v in exact_values]
+        )
         ws_list = qs.get("workspace", [])
         wsid = ws_list[0] if ws_list else None
+        account_list = qs.get("account", [])
+        account_filter = account_list[0] if account_list else None
         con = db.open_ro(self.db_path)
         fts_con = None
         if terms and self.fts_path:
@@ -128,18 +140,26 @@ class Handler(BaseHTTPRequestHandler):
                 fts_con = None
         try:
             if terms:
-                result = search.search(con, terms, workspace_id=wsid, fts_con=fts_con)
+                result = search.search(
+                    con,
+                    terms,
+                    workspace_id=wsid,
+                    fts_con=fts_con,
+                    account_index=self.account_index,
+                )
             else:
-                rows = db.list_sessions(con)
+                rows = db.list_sessions(con, account_index=self.account_index)
                 if wsid:
                     rows = [r for r in rows if r["workspace_id"] == wsid]
                 for r in rows:
                     r["snippets"] = []
+                    r["match_kind"] = "and"
                 result = rows
         finally:
             con.close()
             if fts_con is not None:
                 fts_con.close()
+        result = accounts.filter_by_account(result, account_filter)
         self._send_json(200, result)
 
     def _handle_export(self) -> None:
@@ -244,6 +264,7 @@ def make_server(
     port: int = 0,
     db_path: str | None = None,
     fts_path: str | None | object = ...,
+    account_index: dict[str, str] | None = None,
 ) -> ThreadingHTTPServer:
     """Construct (don't start) a ThreadingHTTPServer with the routes wired.
 
@@ -253,6 +274,10 @@ def make_server(
       - Sentinel (default): use ``fts.DEFAULT_FTS_PATH``.
       - None: disable FTS, fall back to LIKE on every search.
       - str: use this path explicitly (useful for tests).
+    account_index:
+      - None (default): no account decoration — rows get ``account: null``.
+      - dict: mapping of session_id -> account display name, built once at
+        startup by ``accounts.build_index()``.
     """
     resolved_db = db_path or db.DEFAULT_DB_PATH
     if fts_path is ...:
@@ -265,6 +290,7 @@ def make_server(
 
     BoundHandler.db_path = resolved_db
     BoundHandler.fts_path = resolved_fts
+    BoundHandler.account_index = account_index or {}
     httpd = ThreadingHTTPServer((host, port), BoundHandler)
     return httpd
 
@@ -344,12 +370,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             resolved_fts = None
 
+    # Build the account index once at startup. Refresh requires restart.
+    try:
+        account_index = accounts.build_index()
+        sys.stderr.write(
+            f"Account index built: {len(account_index)} session(s) across "
+            f"{len(accounts.discover_account_dirs())} Claude account dir(s)\n"
+        )
+    except Exception as e:  # noqa: BLE001 — defensive; never block startup
+        sys.stderr.write(f"WARN: account index build failed ({e}); orphan column disabled.\n")
+        account_index = {}
+
     try:
         httpd = make_server(
             host=args.host,
             port=args.port,
             db_path=args.db,
             fts_path=resolved_fts,
+            account_index=account_index,
         )
     except OSError as e:
         sys.stderr.write(f"ERROR binding {args.host}:{args.port}: {e}\n")

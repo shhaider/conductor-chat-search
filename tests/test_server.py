@@ -115,6 +115,9 @@ def test_health_endpoint(running_server):
     assert status == 200
     assert body["ok"] is True
     assert "schema_version" in body
+    # New accounts field — defaults to 0 in tests (no account index injected).
+    assert "accounts_indexed" in body
+    assert isinstance(body["accounts_indexed"], int)
 
 
 def test_workspaces_endpoint(running_server):
@@ -128,14 +131,14 @@ def test_sessions_no_query(running_server):
     status, body = _get_json(running_server["base"] + "/api/sessions")
     assert status == 200
     ids = sorted(s["session_id"] for s in body)
-    assert ids == ["sA", "sB", "sC", "sD"]
+    assert ids == ["sA", "sB", "sC", "sD", "sE"]
 
 
 def test_sessions_search_one_term(running_server):
     status, body = _get_json(running_server["base"] + "/api/sessions?q=cat")
     assert status == 200
     ids = sorted(s["session_id"] for s in body)
-    assert ids == ["sA", "sB"]
+    assert ids == ["sA", "sB", "sE"]
     # snippets should contain the «match» marker
     for s in body:
         assert s["snippets"]
@@ -145,8 +148,8 @@ def test_sessions_search_one_term(running_server):
 def test_sessions_search_and_terms(running_server):
     status, body = _get_json(running_server["base"] + "/api/sessions?q=cat&q=happy")
     assert status == 200
-    ids = [s["session_id"] for s in body]
-    assert ids == ["sB"]
+    ids = sorted(s["session_id"] for s in body)
+    assert ids == ["sB", "sE"]
 
 
 def test_export_writes_file(running_server):
@@ -179,3 +182,103 @@ def test_root_serves_html(running_server):
 def test_static_path_traversal_refused(running_server):
     status, _ctype, _body = _get_raw(running_server["base"] + "/static/../etc/passwd")
     assert status in (400, 404)
+
+
+# -- Feature A: account field --
+
+
+def test_sessions_carry_account_field(running_server):
+    """Every row in /api/sessions has the ``account`` key (may be null)."""
+    status, body = _get_json(running_server["base"] + "/api/sessions")
+    assert status == 200
+    for s in body:
+        assert "account" in s
+        # Tests don't inject an account_index, so every row is None.
+        assert s["account"] is None
+
+
+def test_sessions_search_results_carry_account_field(running_server):
+    status, body = _get_json(running_server["base"] + "/api/sessions?q=cat")
+    assert status == 200
+    for s in body:
+        assert "account" in s
+
+
+def test_sessions_account_filter_orphaned(running_server):
+    """?account=__orphaned__ returns rows where account is None.
+
+    In this test setup no index is injected so every row is orphaned —
+    this filter returns the full set.
+    """
+    status, body = _get_json(
+        running_server["base"] + "/api/sessions?account=__orphaned__"
+    )
+    assert status == 200
+    ids = sorted(s["session_id"] for s in body)
+    assert ids == ["sA", "sB", "sC", "sD", "sE"]
+
+
+def test_sessions_account_filter_unknown_account_returns_empty(running_server):
+    """Filtering by a non-existent account returns an empty list."""
+    status, body = _get_json(
+        running_server["base"] + "/api/sessions?account=ghost-account"
+    )
+    assert status == 200
+    assert body == []
+
+
+# -- Feature B: exact-phrase + match_kind --
+
+
+def test_sessions_match_kind_field_present(running_server):
+    """Every row carries match_kind = 'and' or 'exact'."""
+    status, body = _get_json(running_server["base"] + "/api/sessions?q=cat")
+    assert status == 200
+    for s in body:
+        assert s["match_kind"] in ("and", "exact")
+        assert s["match_kind"] == "and"
+
+
+def test_sessions_q_exact_param(running_server):
+    """?q_exact=<phrase> matches the contiguous substring and marks the row
+    as match_kind='exact'."""
+    from urllib.parse import quote
+    phrase = "migration of the 684 sites"
+    url = running_server["base"] + "/api/sessions?q_exact=" + quote(phrase)
+    status, body = _get_json(url)
+    assert status == 200
+    ids = [s["session_id"] for s in body]
+    assert ids == ["sE"]
+    assert body[0]["match_kind"] == "exact"
+    # Snippet wraps the whole phrase, not individual words.
+    snip = body[0]["snippets"][0]
+    assert "«migration of the 684 sites»" in snip["text"]
+    assert snip["exact"] is True
+
+
+def test_sessions_q_exact_no_match(running_server):
+    """A phrase that's not present returns an empty list."""
+    from urllib.parse import quote
+    url = (
+        running_server["base"]
+        + "/api/sessions?q_exact="
+        + quote("not a phrase that exists anywhere")
+    )
+    status, body = _get_json(url)
+    assert status == 200
+    assert body == []
+
+
+def test_sessions_mixed_q_and_q_exact(running_server):
+    """Combining an AND term with an exact phrase requires both to match."""
+    from urllib.parse import quote
+    url = (
+        running_server["base"]
+        + "/api/sessions?q=happy&q_exact="
+        + quote("migration of the 684 sites")
+    )
+    status, body = _get_json(url)
+    assert status == 200
+    ids = [s["session_id"] for s in body]
+    assert ids == ["sE"]
+    assert body[0]["match_kind"] == "exact"

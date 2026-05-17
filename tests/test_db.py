@@ -99,6 +99,30 @@ def test_get_schema_version(fixture_db):
         con.close()
 
 
+def test_list_sessions_account_field_default_null(fixture_db):
+    """Without an account index, every row's ``account`` field is None."""
+    con = db.open_ro(fixture_db)
+    try:
+        sessions = db.list_sessions(con)
+        assert all("account" in s for s in sessions)
+        assert all(s["account"] is None for s in sessions)
+    finally:
+        con.close()
+
+
+def test_list_sessions_account_field_populated(fixture_db):
+    """With an account index, matching session ids carry the account name."""
+    con = db.open_ro(fixture_db)
+    try:
+        index = {"s1": "account2", "s3": "default"}  # s2 absent → orphaned
+        sessions = db.list_sessions(con, account_index=index)
+        by_id = {s["session_id"]: s for s in sessions}
+        assert by_id["s1"]["account"] == "account2"
+        assert by_id["s2"]["account"] is None  # orphaned
+    finally:
+        con.close()
+
+
 def test_readonly_writes_blocked(fixture_db):
     con = db.open_ro(fixture_db)
     try:

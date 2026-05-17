@@ -118,13 +118,14 @@ def test_backfill_indexes_only_text_fragments(tmp_path):
     try:
         stats = fts.build_or_sync(fcon, src, progress_stream=None)
         # The search fixture has: mA1 (text), mA2 (tool_use), mB1 (text), mB2
-        # (text), mC1 (tool_result), mD1 (thinking) → 3 indexed, 3 skipped.
+        # (text), mC1 (tool_result), mD1 (thinking), mE1 (text) → 4 indexed,
+        # 3 skipped.
         assert stats["is_initial_build"] is True
-        assert stats["indexed"] == 3
+        assert stats["indexed"] == 4
         assert stats["skipped"] == 3
-        # Now MATCH "cat" — should hit mA1 and mB2, but NOT mC1 or mD1.
+        # Now MATCH "cat" — should hit mA1, mB2, mE1, but NOT mC1 or mD1.
         hits = fts.search_term(fcon, "cat")
-        assert hits == {"mA1", "mB2"}
+        assert hits == {"mA1", "mB2", "mE1"}
     finally:
         fcon.close()
         src.close()
@@ -257,15 +258,15 @@ def test_search_with_fts_matches_like_results(tmp_path):
 
         like_ids = sorted(r["session_id"] for r in like_results)
         fts_ids = sorted(r["session_id"] for r in fts_results)
-        assert like_ids == fts_ids == ["sA", "sB"]
+        assert like_ids == fts_ids == ["sA", "sB", "sE"]
 
-        # AND semantics
+        # AND semantics: "cat" + "happy" → sB and sE.
         and_results = search.search(src, ["cat", "happy"], fts_con=fcon)
-        assert sorted(r["session_id"] for r in and_results) == ["sB"]
+        assert sorted(r["session_id"] for r in and_results) == ["sB", "sE"]
 
         # Workspace filter
         wsx = search.search(src, ["cat"], workspace_id="ws-x", fts_con=fcon)
-        assert sorted(r["session_id"] for r in wsx) == ["sA", "sB"]
+        assert sorted(r["session_id"] for r in wsx) == ["sA", "sB", "sE"]
         wsy = search.search(src, ["cat"], workspace_id="ws-y", fts_con=fcon)
         assert wsy == []
 
@@ -296,7 +297,7 @@ def test_search_empty_terms_unchanged_with_fts(tmp_path):
         fts.build_or_sync(fcon, src, progress_stream=None)
         out = search.search(src, [], fts_con=fcon)
         ids = sorted(r["session_id"] for r in out)
-        assert ids == ["sA", "sB", "sC", "sD"]
+        assert ids == ["sA", "sB", "sC", "sD", "sE"]
     finally:
         fcon.close()
         src.close()
@@ -311,7 +312,7 @@ def test_search_with_fts_con_none_uses_like(tmp_path):
     src = db.open_ro(src_path)
     try:
         results = search.search(src, ["cat"], fts_con=None)
-        assert sorted(r["session_id"] for r in results) == ["sA", "sB"]
+        assert sorted(r["session_id"] for r in results) == ["sA", "sB", "sE"]
     finally:
         src.close()
 
@@ -362,7 +363,7 @@ def test_has_fts5_fallback_path_is_exercisable(monkeypatch):
         src = db.open_ro(src_path)
         try:
             results = search.search(src, ["cat"], fts_con=None)
-            assert sorted(r["session_id"] for r in results) == ["sA", "sB"]
+            assert sorted(r["session_id"] for r in results) == ["sA", "sB", "sE"]
         finally:
             src.close()
     finally:

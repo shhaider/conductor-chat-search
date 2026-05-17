@@ -41,8 +41,9 @@
   .controls select { padding: 7px 9px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; }
   .controls select:disabled { opacity: 0.5; cursor: not-allowed; }
   #results { padding: 12px 20px; }
-  .row { background: var(--row); border: 1px solid var(--border); padding: 11px 14px; margin-bottom: 9px; border-radius: 5px; }
+  .row { background: var(--row); border: 1px solid var(--border); padding: 11px 14px; margin-bottom: 9px; border-radius: 5px; border-left: 3px solid transparent; }
   .row:hover { background: var(--row-hover); }
+  .row.exact { border-left-color: var(--accent); background: linear-gradient(90deg, rgba(122,162,247,0.08) 0%, rgba(122,162,247,0) 70%), var(--row); }
   .row-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
   .title { font-weight: 600; color: var(--fg); }
   .sid { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); font-size: 11px; }
@@ -50,6 +51,16 @@
   .model { color: var(--muted); font-size: 12px; }
   .age { color: var(--muted); font-size: 12px; }
   .mcount { color: var(--muted); font-size: 12px; }
+  /* Account badge: which Claude account holds the resumable JSONL for this session. */
+  .acct { font-size: 11px; color: #b6c0d4; background: #2a2f3a; padding: 1px 6px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .acct.orphaned { color: var(--error); background: #3a1d24; }
+  /* Match-kind badge: 'exact' (phrase hit) vs. 'and' (AND-of-words). */
+  .badge-mk { font-size: 11px; padding: 1px 6px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .badge-mk.exact { color: var(--mark-fg); background: var(--mark-bg); font-weight: 600; }
+  .badge-mk.and { color: var(--muted); background: #25272d; }
+  /* Exact-phrase toggle label next to the search input. */
+  .exact-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; user-select: none; cursor: pointer; padding: 0 4px; }
+  .exact-toggle input { margin: 0; cursor: pointer; }
   .snippets { margin-top: 8px; padding-left: 10px; border-left: 2px solid var(--border); }
   .snippet { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; background: var(--code-bg); padding: 4px 7px; border-radius: 3px; margin: 4px 0; line-height: 1.4; color: #cdd6f4; }
   .snippet .term-label { color: var(--accent); margin-right: 6px; }
@@ -113,9 +124,17 @@
 
 <div class="controls">
   <input id="q" type="search" placeholder='type words to search (space = AND, "quoted" = exact phrase)' autocomplete="off" autofocus>
+  <label class="exact-toggle" title="When ON, the entire input is sent as one phrase (no word splitting).">
+    <input id="exact-toggle" type="checkbox">
+    Exact phrase
+  </label>
   <button id="clear">Clear</button>
   <select id="workspace">
     <option value="">All workspaces</option>
+  </select>
+  <select id="account" title="Filter by which Claude account holds this session's resumable JSONL.">
+    <option value="">All accounts</option>
+    <option value="__orphaned__">(orphaned)</option>
   </select>
 </div>
 
@@ -131,12 +150,17 @@
 const $ = (s) => document.querySelector(s);
 const elQ = $("#q");
 const elWs = $("#workspace");
+const elAcct = $("#account");
+const elExactToggle = $("#exact-toggle");
 const elResults = $("#results");
 const elStatus = $("#status");
 const elSearchStatus = $("#search-status");
 const elMeta = $("#meta");
 const elBanner = $("#banner");
 const elPerfBanner = $("#perf-banner");
+const ORPHANED_SENTINEL = "__orphaned__";
+// Accounts seen across all loaded rows. Used to populate the filter dropdown.
+let seenAccounts = new Set();
 
 let lastFetchToken = 0;
 let debounceTimer = null;
@@ -146,13 +170,29 @@ let inflightController = null;
 
 const PERF_BANNER_KEY = "cchat-perf-banner-dismissed";
 
-// Parse search input into terms. Whitespace = AND; "double-quoted" = single term.
-function parseTerms(s) {
+// Parse search input into structured terms.
+//
+// Each returned item is {value: string, exact: bool}.
+//   - When the "Exact phrase" toggle is ON: the entire input is one exact term.
+//   - Otherwise: whitespace = AND; "double-quoted" = one exact term.
+//
+// Empty / whitespace-only input → empty array.
+function parseTerms(s, forceExact) {
+  const trimmed = (s || "").trim();
+  if (!trimmed) return [];
+  if (forceExact) {
+    return [{value: trimmed, exact: true}];
+  }
   const terms = [];
   const re = /"([^"]+)"|(\S+)/g;
   let m;
   while ((m = re.exec(s)) !== null) {
-    terms.push(m[1] || m[2]);
+    if (m[1] !== undefined) {
+      // Came from a "quoted" chunk → exact-phrase.
+      terms.push({value: m[1], exact: true});
+    } else {
+      terms.push({value: m[2], exact: false});
+    }
   }
   return terms;
 }
@@ -250,7 +290,12 @@ async function loadWorkspaces() {
 async function loadHealth() {
   try {
     const h = await fetchJson("/api/health");
-    elMeta.textContent = h.schema_version ? `schema ${h.schema_version}` : "schema unknown";
+    const parts = [];
+    parts.push(h.schema_version ? `schema ${h.schema_version}` : "schema unknown");
+    if (typeof h.accounts_indexed === "number") {
+      parts.push(`${h.accounts_indexed} session(s) indexed across Claude accounts`);
+    }
+    elMeta.textContent = parts.join(" · ");
     if (h.schema_warning) {
       elBanner.textContent = h.schema_warning;
       elBanner.classList.remove("hidden");
@@ -270,16 +315,20 @@ async function loadSessions() {
   inflightController = controller;
 
   const token = ++lastFetchToken;
-  const terms = parseTerms(elQ.value);
+  const terms = parseTerms(elQ.value, elExactToggle.checked);
   const wsid = elWs.value;
+  const acct = elAcct.value;
   const params = [];
-  for (const t of terms) params.push(["q", t]);
+  for (const t of terms) {
+    params.push([t.exact ? "q_exact" : "q", t.value]);
+  }
   if (wsid) params.push(["workspace", wsid]);
+  if (acct) params.push(["account", acct]);
   const url = "/api/sessions" + (params.length ? "?" + buildQS(params) : "");
 
   // Status line above results
   if (terms.length) {
-    const shown = terms.map((t) => `"${t}"`).join(" + ");
+    const shown = terms.map((t) => t.exact ? `«${t.value}»` : `"${t.value}"`).join(" + ");
     setSearchStatus(`Searching for ${shown}…`, "loading");
   } else {
     setSearchStatus(null);
@@ -291,9 +340,10 @@ async function loadSessions() {
     const data = await fetchJson(url, { signal: controller.signal });
     if (token !== lastFetchToken) return; // stale response (shouldn't fire since we abort, but defensive)
     const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
+    updateSeenAccounts(data);
     render(data, terms);
     if (terms.length) {
-      const shown = terms.map((t) => `"${t}"`).join(" + ");
+      const shown = terms.map((t) => t.exact ? `«${t.value}»` : `"${t.value}"`).join(" + ");
       setSearchStatus(`Found ${data.length} match${data.length === 1 ? "" : "es"} for ${shown} in ${elapsed}s`, "ok");
     } else {
       setSearchStatus(null);
@@ -314,6 +364,32 @@ async function loadSessions() {
   }
 }
 
+// Walk the loaded rows and add any unseen account names to the filter dropdown.
+// Preserves current selection if still valid. Builds the dropdown each call;
+// cost is negligible (handful of accounts max).
+function updateSeenAccounts(rows) {
+  let changed = false;
+  for (const r of rows) {
+    if (r && r.account && !seenAccounts.has(r.account)) {
+      seenAccounts.add(r.account);
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  const current = elAcct.value;
+  const sortedAccounts = Array.from(seenAccounts).sort();
+  const opts = ['<option value="">All accounts</option>'];
+  for (const a of sortedAccounts) {
+    opts.push(`<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`);
+  }
+  opts.push('<option value="__orphaned__">(orphaned)</option>');
+  elAcct.innerHTML = opts.join("");
+  // Restore previous selection if it still exists.
+  if (current && Array.from(elAcct.options).some(o => o.value === current)) {
+    elAcct.value = current;
+  }
+}
+
 function render(sessions, terms) {
   if (!sessions.length) {
     elResults.innerHTML = '<div class="empty">No sessions match.' +
@@ -327,17 +403,31 @@ function render(sessions, terms) {
     const model = escapeHtml(s.model || "?");
     const age = escapeHtml(relAge(s.updated_at || s.last_user_message_at || s.created_at));
     const mc = (s.message_count == null) ? "" : `${s.message_count} msgs`;
+    // Account badge: which Claude account holds this session's resumable JSONL.
+    let acctHtml = "";
+    if (s.account === null || s.account === undefined) {
+      acctHtml = '<span class="acct orphaned" title="No Claude account holds the resumable JSONL for this session — Claude Code cannot resume it.">(orphaned)</span>';
+    } else {
+      acctHtml = `<span class="acct" title="Resumable JSONL lives under ~/.claude${s.account === "default" ? "" : "-" + s.account}/projects/">${escapeHtml(s.account)}</span>`;
+    }
+    // Match-kind badge: exact-phrase vs. AND-of-words.
+    const mk = s.match_kind === "exact" ? "exact" : "and";
+    const mkLabel = mk === "exact" ? "🎯 exact" : "🔍 and";
+    const mkHtml = `<span class="badge-mk ${mk}" title="${mk === "exact" ? "Matched as a contiguous phrase" : "Matched all words (AND)"}">${mkLabel}</span>`;
     let snippetsHtml = "";
     if (Array.isArray(s.snippets) && s.snippets.length) {
       snippetsHtml = '<div class="snippets">' + s.snippets.map((sn) =>
         `<div class="snippet"><span class="term-label">${escapeHtml(sn.term)}:</span>${snippetHtml(sn.text)}</div>`
       ).join("") + "</div>";
     }
+    const rowClass = "row" + (mk === "exact" ? " exact" : "");
     return `
-      <div class="row" data-sid="${sid}">
+      <div class="${rowClass}" data-sid="${sid}">
         <div class="row-head">
           <span class="title">${title}</span>
+          ${mkHtml}
           <span class="ws">${ws}</span>
+          ${acctHtml}
           <span class="model">${model}</span>
           <span class="age">${age}</span>
           <span class="mcount">${escapeHtml(mc)}</span>
@@ -397,6 +487,8 @@ $("#refresh").addEventListener("click", () => {
 });
 
 elWs.addEventListener("change", loadSessions);
+elAcct.addEventListener("change", loadSessions);
+elExactToggle.addEventListener("change", loadSessions);
 
 // Perf banner (issue #2) — dismissible, sticky via localStorage.
 function initPerfBanner() {

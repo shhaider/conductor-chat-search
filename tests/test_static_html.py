@@ -96,6 +96,68 @@ def test_index_contains_search_failed_copy():
     assert "Search failed: " in html
 
 
+# -------- Feature A: account column --------
+
+
+def test_index_contains_account_dropdown():
+    html = _read_index()
+    assert 'id="account"' in html
+    assert "All accounts" in html
+    assert "__orphaned__" in html
+
+
+def test_index_contains_account_badge_css():
+    html = _read_index()
+    assert ".acct" in html
+    assert ".acct.orphaned" in html
+
+
+def test_index_contains_orphaned_copy():
+    html = _read_index()
+    # Visual marker text for sessions Claude Code cannot resume.
+    assert "(orphaned)" in html
+
+
+def test_index_contains_accounts_indexed_meta():
+    html = _read_index()
+    # The /api/health response's accounts_indexed field is surfaced in the meta line.
+    assert "accounts_indexed" in html
+
+
+# -------- Feature B: exact-phrase toggle + match_kind badges --------
+
+
+def test_index_contains_exact_toggle():
+    html = _read_index()
+    assert 'id="exact-toggle"' in html
+    assert "Exact phrase" in html
+
+
+def test_index_contains_match_kind_badge_css():
+    html = _read_index()
+    assert "badge-mk" in html
+    assert ".badge-mk.exact" in html
+    assert ".badge-mk.and" in html
+
+
+def test_index_contains_exact_row_accent():
+    html = _read_index()
+    # Visual cue for exact-phrase rows (left border accent).
+    assert ".row.exact" in html
+
+
+def test_index_emits_q_exact_param():
+    html = _read_index()
+    # The JS sends q_exact for phrase terms, q for AND terms.
+    assert "q_exact" in html
+
+
+def test_index_contains_match_kind_field_reference():
+    html = _read_index()
+    # render() inspects s.match_kind to set the badge class.
+    assert "match_kind" in html
+
+
 # -------- live (boot the server and curl /) --------
 
 
