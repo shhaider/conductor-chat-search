@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.vscode/
+.idea/
+venv/
+.venv/
+*.egg-info/
+
+# Local test fixtures may include real DB paths
+tests/fixtures/*.db-shm
+tests/fixtures/*.db-wal
+
+# Local-only run state
+.run.pid
+.port
+
+# OS junk
+.AppleDouble
+.LSOverride
+Icon?
