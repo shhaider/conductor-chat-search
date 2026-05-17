@@ -36,10 +36,10 @@ This is a small, coherent project — **NOT split into sub-projects**. One bound
 
 | Node ID | Description | Status | Owner |
 |---|---|---|---|
-| P01 | Server: list sessions | ⬜ NOT STARTED | (impl subagent) |
+| P01 | Server: list sessions (db.py) | ✅ DONE | (impl subagent) |
 | P02 | Server: search messages | ⬜ NOT STARTED | (impl subagent) |
 | P03 | Server: export endpoint | ⬜ NOT STARTED | (impl subagent) |
 | P04 | Frontend: single-page HTML | ⬜ NOT STARTED | (impl subagent) |
 | P05 | Launch script + browser opener | ⬜ NOT STARTED | (impl subagent) |
-| P06 | Shared extraction module (refactor from CLI) | ⬜ NOT STARTED | (impl subagent) |
+| P06 | Shared extraction module (render.py) | ✅ DONE | (impl subagent) |
 | P07 | Tests + verification | ⬜ NOT STARTED | (verifier subagent) |
