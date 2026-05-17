@@ -1,19 +1,25 @@
 """Two-pass term search over Conductor message text.
 
-Pass 1: SQL ``LIKE '%term%'`` against the raw ``session_messages.content`` column
-filters candidate sessions cheaply (no JSON parsing in SQL). Pass 2: Python
-parses each candidate message's JSON ``content`` and confirms the term appears
-inside a ``type=="text"`` block — i.e. user prose or assistant prose, not tool
-inputs, tool results, or thinking blocks.
+Pass 1: FTS5 MATCH (or SQL LIKE fallback) against an index of just the
+``type=="text"`` fragments of session_messages. Returns candidate session_ids
+cheaply.
+
+Pass 2: Python parses each candidate message's JSON ``content`` and confirms
+the term appears inside a ``type=="text"`` block — i.e. user prose or
+assistant prose, not tool inputs, tool results, or thinking blocks. This is
+kept as defense-in-depth: FTS5 tokenisation can disagree with substring match
+at hyphens, dots, and other punctuation, and we want the on-screen snippet
+to actually contain the term.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from typing import Any
 
-from . import db
+from . import db, fts
 
 SNIPPET_RADIUS = 80
 
@@ -23,6 +29,7 @@ def search(
     terms: list[str],
     workspace_id: str | None = None,
     limit: int = 500,
+    fts_con: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
     """AND-search across user+assistant text content.
 
@@ -34,10 +41,13 @@ def search(
     Semantics:
       - Empty terms list -> identical to ``db.list_sessions`` (no filtering).
       - All terms must match somewhere in the session (AND).
-      - Term match is case-insensitive substring.
+      - Term match is case-insensitive substring (LIKE fallback) or FTS5
+        tokenised phrase (when ``fts_con`` is provided).
       - Match must be inside a content item with ``type=="text"``; tool inputs,
         tool results, and thinking blocks do NOT count.
       - If workspace_id is set, restrict to that workspace.
+      - ``fts_con``: an open connection to the sidecar FTS index. When provided,
+        pass-1 uses FTS5 MATCH instead of LIKE. None means LIKE fallback.
     """
     normalised_terms = [t for t in (s.strip() for s in terms) if t]
 
@@ -49,12 +59,16 @@ def search(
             s["snippets"] = []
         return sessions
 
-    # Pass 1: candidate session_ids that contain each term in raw content.
+    # Pass 1: candidate session_ids that contain each term.
     candidate_sets: list[set[str]] = []
     for term in normalised_terms:
-        candidate_sets.append(_candidates_for_term(con, term, workspace_id))
+        candidate_sets.append(
+            _candidates_for_term(con, term, workspace_id, fts_con=fts_con)
+        )
 
-    candidate_ids: set[str] = set.intersection(*candidate_sets) if candidate_sets else set()
+    candidate_ids: set[str] = (
+        set.intersection(*candidate_sets) if candidate_sets else set()
+    )
     if not candidate_ids:
         return []
 
@@ -98,11 +112,73 @@ def search(
 
 
 def _candidates_for_term(
+    con: sqlite3.Connection,
+    term: str,
+    workspace_id: str | None,
+    fts_con: sqlite3.Connection | None,
+) -> set[str]:
+    """Return session_ids whose any message contains the term, via FTS5 if
+    available, else SQL LIKE."""
+    if fts_con is not None:
+        return _candidates_via_fts(con, fts_con, term, workspace_id)
+    return _candidates_via_like(con, term, workspace_id)
+
+
+def _candidates_via_fts(
+    con: sqlite3.Connection,
+    fts_con: sqlite3.Connection,
+    term: str,
+    workspace_id: str | None,
+) -> set[str]:
+    """Pass-1 via FTS5 MATCH. Returns session_ids whose any message_id is in
+    the FTS hit set AND (optionally) belongs to the given workspace."""
+    hit_message_ids = fts.search_term(fts_con, term)
+    if not hit_message_ids:
+        return set()
+    # Resolve message_id -> session_id from conductor.db. Chunked IN to stay
+    # well under SQLite's ~999-param default ceiling.
+    session_ids: set[str] = set()
+    ids = list(hit_message_ids)
+    CHUNK = 800
+    if workspace_id:
+        sql = (
+            "SELECT DISTINCT m.session_id "
+            "FROM session_messages m "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.is_hidden = 0 "
+            "  AND s.workspace_id = ? "
+            "  AND m.id IN ({placeholders})"
+        )
+    else:
+        sql = (
+            "SELECT DISTINCT m.session_id "
+            "FROM session_messages m "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.is_hidden = 0 "
+            "  AND m.id IN ({placeholders})"
+        )
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        params: list[Any] = []
+        if workspace_id:
+            params.append(workspace_id)
+        params.extend(chunk)
+        rows = con.execute(
+            sql.format(placeholders=placeholders), params
+        ).fetchall()
+        session_ids.update(r[0] for r in rows)
+    return session_ids
+
+
+def _candidates_via_like(
     con: sqlite3.Connection, term: str, workspace_id: str | None
 ) -> set[str]:
     """SQL LIKE pre-filter. Returns session_ids whose any message's raw content contains term.
 
     Case-insensitive via SQLite's NOCASE collation on the LIKE comparison.
+    Slow on large corpora (full table scan, no index use) — kept as fallback
+    when FTS5 isn't available.
     """
     pattern = f"%{_escape_like(term)}%"
     if workspace_id:

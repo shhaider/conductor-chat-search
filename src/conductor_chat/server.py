@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 from http import HTTPStatus
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import db, export, search
+from . import db, export, fts, search
 
 STATIC_DIR = Path(__file__).parent / "static"
 ALLOWED_STATIC: set[str] = {"index.html"}
@@ -37,6 +38,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # injected at server construction time
     db_path: str = db.DEFAULT_DB_PATH
+    fts_path: str | None = fts.DEFAULT_FTS_PATH  # None = disable FTS (LIKE fallback)
 
     # ---- routing ----
 
@@ -117,9 +119,16 @@ class Handler(BaseHTTPRequestHandler):
         ws_list = qs.get("workspace", [])
         wsid = ws_list[0] if ws_list else None
         con = db.open_ro(self.db_path)
+        fts_con = None
+        if terms and self.fts_path:
+            try:
+                fts_con = fts.open_fts(self.fts_path)
+            except sqlite3.OperationalError as e:
+                sys.stderr.write(f"FTS open failed, falling back to LIKE: {e}\n")
+                fts_con = None
         try:
             if terms:
-                result = search.search(con, terms, workspace_id=wsid)
+                result = search.search(con, terms, workspace_id=wsid, fts_con=fts_con)
             else:
                 rows = db.list_sessions(con)
                 if wsid:
@@ -129,6 +138,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = rows
         finally:
             con.close()
+            if fts_con is not None:
+                fts_con.close()
         self._send_json(200, result)
 
     def _handle_export(self) -> None:
@@ -232,18 +243,28 @@ def make_server(
     host: str = "127.0.0.1",
     port: int = 0,
     db_path: str | None = None,
+    fts_path: str | None | object = ...,
 ) -> ThreadingHTTPServer:
     """Construct (don't start) a ThreadingHTTPServer with the routes wired.
 
     port=0 → kernel-assigned; the actual port is in ``server.server_address[1]``.
     db_path=None uses ``db.DEFAULT_DB_PATH``.
+    fts_path:
+      - Sentinel (default): use ``fts.DEFAULT_FTS_PATH``.
+      - None: disable FTS, fall back to LIKE on every search.
+      - str: use this path explicitly (useful for tests).
     """
     resolved_db = db_path or db.DEFAULT_DB_PATH
+    if fts_path is ...:
+        resolved_fts: str | None = fts.DEFAULT_FTS_PATH
+    else:
+        resolved_fts = fts_path  # may be None to disable
 
     class BoundHandler(Handler):
         pass
 
     BoundHandler.db_path = resolved_db
+    BoundHandler.fts_path = resolved_fts
     httpd = ThreadingHTTPServer((host, port), BoundHandler)
     return httpd
 
@@ -254,6 +275,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=17891)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--db", default=db.DEFAULT_DB_PATH)
+    parser.add_argument("--fts-db", default=fts.DEFAULT_FTS_PATH,
+                        help="Sidecar FTS5 index path. Pass empty string to disable.")
+    parser.add_argument("--no-fts", action="store_true",
+                        help="Disable FTS5; force LIKE fallback.")
     parser.add_argument("--no-open", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -262,23 +287,70 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # Schema sanity check (warn only).
+    schema_ver: str | None = None
     try:
         con = db.open_ro(args.db)
         try:
-            ver = db.get_schema_version(con)
+            schema_ver = db.get_schema_version(con)
         finally:
             con.close()
         sys.stderr.write(
-            f"Conductor DB OK (latest migration: {ver if ver else 'unknown'})\n"
+            f"Conductor DB OK (latest migration: {schema_ver if schema_ver else 'unknown'})\n"
         )
-        if ver and not str(ver).startswith(KNOWN_GOOD_SCHEMA_PREFIX):
-            sys.stderr.write(f"WARN: untested schema version {ver}\n")
+        if schema_ver and not str(schema_ver).startswith(KNOWN_GOOD_SCHEMA_PREFIX):
+            sys.stderr.write(f"WARN: untested schema version {schema_ver}\n")
     except Exception as e:
         sys.stderr.write(f"ERROR opening DB: {e}\n")
         return 1
 
+    # Resolve FTS path. CLI --no-fts wins; empty --fts-db also disables.
+    if args.no_fts or not args.fts_db:
+        resolved_fts: str | None = None
+        sys.stderr.write("FTS5 disabled (--no-fts or empty --fts-db); using LIKE fallback.\n")
+    elif not fts.has_fts5():
+        resolved_fts = None
+        sys.stderr.write(
+            "WARN: this Python's bundled SQLite has no FTS5 support; "
+            "falling back to LIKE (slow on large corpora).\n"
+        )
+    else:
+        resolved_fts = args.fts_db
+        # Build or sync the FTS index before opening the port. We hold open
+        # one src_con for the duration; sync re-uses the same read-only handle.
+        try:
+            src_con = db.open_ro(args.db)
+            try:
+                fts_con = fts.open_fts(resolved_fts)
+                try:
+                    fts.check_schema_version(fts_con, schema_ver)
+                    stats = fts.build_or_sync(fts_con, src_con)
+                    if stats["is_initial_build"]:
+                        sys.stderr.write(
+                            f"FTS index built at {resolved_fts}\n"
+                        )
+                    else:
+                        if stats["indexed"] or stats["skipped"]:
+                            sys.stderr.write(
+                                f"FTS sync: +{stats['indexed']} indexed, "
+                                f"+{stats['skipped']} skipped\n"
+                            )
+                finally:
+                    fts_con.close()
+            finally:
+                src_con.close()
+        except Exception as e:
+            sys.stderr.write(
+                f"WARN: FTS build/sync failed ({e}); falling back to LIKE.\n"
+            )
+            resolved_fts = None
+
     try:
-        httpd = make_server(host=args.host, port=args.port, db_path=args.db)
+        httpd = make_server(
+            host=args.host,
+            port=args.port,
+            db_path=args.db,
+            fts_path=resolved_fts,
+        )
     except OSError as e:
         sys.stderr.write(f"ERROR binding {args.host}:{args.port}: {e}\n")
         return 1
