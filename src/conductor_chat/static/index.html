@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conductor Chat Search</title>
+<style>
+  :root {
+    --bg: #1e1f22;
+    --fg: #e6e6e6;
+    --muted: #999;
+    --accent: #7aa2f7;
+    --row: #26282d;
+    --row-hover: #2e3036;
+    --code-bg: #14151a;
+    --mark-bg: #2d4a87;
+    --mark-fg: #fff;
+    --border: #3a3c42;
+    --error: #f7768e;
+    --ok: #9ece6a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; font-size: 14px; }
+  header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  button { background: var(--row); color: var(--fg); border: 1px solid var(--border); padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button:hover { background: var(--row-hover); }
+  .controls { display: flex; gap: 10px; padding: 14px 20px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 49px; z-index: 4; }
+  .controls input[type="search"] { flex: 1 1 360px; min-width: 240px; padding: 8px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; }
+  .controls select { padding: 7px 9px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; }
+  #results { padding: 12px 20px; }
+  .row { background: var(--row); border: 1px solid var(--border); padding: 11px 14px; margin-bottom: 9px; border-radius: 5px; }
+  .row:hover { background: var(--row-hover); }
+  .row-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .title { font-weight: 600; color: var(--fg); }
+  .sid { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); font-size: 11px; }
+  .ws { color: var(--accent); font-size: 12px; }
+  .model { color: var(--muted); font-size: 12px; }
+  .age { color: var(--muted); font-size: 12px; }
+  .mcount { color: var(--muted); font-size: 12px; }
+  .snippets { margin-top: 8px; padding-left: 10px; border-left: 2px solid var(--border); }
+  .snippet { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; background: var(--code-bg); padding: 4px 7px; border-radius: 3px; margin: 4px 0; line-height: 1.4; color: #cdd6f4; }
+  .snippet .term-label { color: var(--accent); margin-right: 6px; }
+  mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0 2px; border-radius: 2px; }
+  .row-actions { margin-top: 9px; }
+  .status { padding: 9px 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; position: sticky; bottom: 0; background: var(--bg); }
+  .status.error { color: var(--error); }
+  .status.ok { color: var(--ok); }
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-style: italic; }
+  .banner { padding: 8px 20px; background: #3a2a1a; color: #f7c878; font-size: 12px; border-bottom: 1px solid var(--border); }
+  .banner.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Conductor Chat Search</h1>
+  <span class="meta" id="meta">loading…</span>
+  <button id="refresh" title="Reload from DB">Refresh</button>
+</header>
+
+<div class="banner hidden" id="banner"></div>
+
+<div class="controls">
+  <input id="q" type="search" placeholder='type words to search (space = AND, "quoted" = exact phrase)' autocomplete="off" autofocus>
+  <button id="clear">Clear</button>
+  <select id="workspace">
+    <option value="">All workspaces</option>
+  </select>
+</div>
+
+<div id="results"><div class="empty">loading…</div></div>
+
+<div class="status" id="status">Ready.</div>
+
+<script>
+"use strict";
+
+const $ = (s) => document.querySelector(s);
+const elQ = $("#q");
+const elWs = $("#workspace");
+const elResults = $("#results");
+const elStatus = $("#status");
+const elMeta = $("#meta");
+const elBanner = $("#banner");
+
+let lastFetchToken = 0;
+let debounceTimer = null;
+
+// Parse search input into terms. Whitespace = AND; "double-quoted" = single term.
+function parseTerms(s) {
+  const terms = [];
+  const re = /"([^"]+)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    terms.push(m[1] || m[2]);
+  }
+  return terms;
+}
+
+function relAge(iso) {
+  if (!iso) return "";
+  const d = new Date(iso.replace(" ", "T") + (iso.endsWith("Z") ? "" : "Z"));
+  if (isNaN(d)) return iso.slice(0, 19);
+  const s = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (s < 60) return Math.floor(s) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  if (s < 86400 * 30) return Math.floor(s / 86400) + "d ago";
+  return d.toISOString().slice(0, 10);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+// Convert «term» markers (from server-side snippets) into <mark>term</mark>.
+function snippetHtml(text) {
+  const escaped = escapeHtml(text);
+  return escaped.replace(/«([^»]+)»/g, "<mark>$1</mark>");
+}
+
+function buildQS(params) {
+  const usp = new URLSearchParams();
+  for (const [k, v] of params) {
+    if (v === undefined || v === null || v === "") continue;
+    usp.append(k, v);
+  }
+  return usp.toString();
+}
+
+async function fetchJson(url, init) {
+  const r = await fetch(url, init);
+  let body = null;
+  try { body = await r.json(); } catch (_) {}
+  if (!r.ok) {
+    const msg = (body && body.error) ? body.error : `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return body;
+}
+
+function setStatus(text, cls) {
+  elStatus.className = "status" + (cls ? " " + cls : "");
+  elStatus.textContent = text;
+}
+
+async function loadWorkspaces() {
+  try {
+    const ws = await fetchJson("/api/workspaces");
+    elWs.innerHTML = '<option value="">All workspaces</option>' +
+      ws.map((w) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.directory_name || w.id)}</option>`).join("");
+  } catch (e) {
+    setStatus("Failed to load workspaces: " + e.message, "error");
+  }
+}
+
+async function loadHealth() {
+  try {
+    const h = await fetchJson("/api/health");
+    elMeta.textContent = h.schema_version ? `schema ${h.schema_version}` : "schema unknown";
+    if (h.schema_warning) {
+      elBanner.textContent = h.schema_warning;
+      elBanner.classList.remove("hidden");
+    }
+  } catch (_) {
+    elMeta.textContent = "(health unknown)";
+  }
+}
+
+async function loadSessions() {
+  const token = ++lastFetchToken;
+  const terms = parseTerms(elQ.value);
+  const wsid = elWs.value;
+  const params = [];
+  for (const t of terms) params.push(["q", t]);
+  if (wsid) params.push(["workspace", wsid]);
+  const url = "/api/sessions" + (params.length ? "?" + buildQS(params) : "");
+  setStatus(terms.length ? `Searching for ${terms.length} term(s)…` : "Loading…");
+  try {
+    const data = await fetchJson(url);
+    if (token !== lastFetchToken) return; // stale response
+    render(data, terms);
+    setStatus(`${data.length} session(s)${terms.length ? " matching all terms" : ""}.`);
+  } catch (e) {
+    if (token !== lastFetchToken) return;
+    elResults.innerHTML = '<div class="empty">Error: ' + escapeHtml(e.message) + "</div>";
+    setStatus("Error: " + e.message, "error");
+  }
+}
+
+function render(sessions, terms) {
+  if (!sessions.length) {
+    elResults.innerHTML = '<div class="empty">No sessions match.' +
+      (terms.length > 1 ? " Try fewer terms." : "") + "</div>";
+    return;
+  }
+  const parts = sessions.map((s) => {
+    const sid = escapeHtml(s.session_id || s.id || "");
+    const title = escapeHtml(s.title || "(no title)");
+    const ws = escapeHtml(s.workspace_name || "?");
+    const model = escapeHtml(s.model || "?");
+    const age = escapeHtml(relAge(s.updated_at || s.last_user_message_at || s.created_at));
+    const mc = (s.message_count == null) ? "" : `${s.message_count} msgs`;
+    let snippetsHtml = "";
+    if (Array.isArray(s.snippets) && s.snippets.length) {
+      snippetsHtml = '<div class="snippets">' + s.snippets.map((sn) =>
+        `<div class="snippet"><span class="term-label">${escapeHtml(sn.term)}:</span>${snippetHtml(sn.text)}</div>`
+      ).join("") + "</div>";
+    }
+    return `
+      <div class="row" data-sid="${sid}">
+        <div class="row-head">
+          <span class="title">${title}</span>
+          <span class="ws">${ws}</span>
+          <span class="model">${model}</span>
+          <span class="age">${age}</span>
+          <span class="mcount">${escapeHtml(mc)}</span>
+          <span class="sid">${sid}</span>
+        </div>
+        ${snippetsHtml}
+        <div class="row-actions">
+          <button class="export-btn" data-sid="${sid}">Export ↓</button>
+        </div>
+      </div>
+    `;
+  });
+  elResults.innerHTML = parts.join("");
+}
+
+elResults.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest(".export-btn");
+  if (!btn) return;
+  const sid = btn.dataset.sid;
+  btn.disabled = true;
+  const oldLabel = btn.textContent;
+  btn.textContent = "Exporting…";
+  setStatus(`Exporting ${sid}…`);
+  try {
+    const r = await fetchJson("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sid, mode: "clean" }),
+    });
+    setStatus(`Wrote ${r.path} (${r.bytes} bytes, ${r.messages} msgs)`, "ok");
+    try { await navigator.clipboard.writeText(r.path); } catch (_) {}
+    btn.textContent = "Exported";
+  } catch (e) {
+    setStatus("Export failed: " + e.message, "error");
+    btn.textContent = oldLabel;
+    btn.disabled = false;
+  }
+});
+
+elQ.addEventListener("input", () => {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(loadSessions, 200);
+});
+
+$("#clear").addEventListener("click", () => {
+  elQ.value = "";
+  loadSessions();
+  elQ.focus();
+});
+
+$("#refresh").addEventListener("click", () => {
+  loadHealth();
+  loadSessions();
+});
+
+elWs.addEventListener("change", loadSessions);
+
+// Initial load
+loadHealth();
+loadWorkspaces();
+loadSessions();
+</script>
+
+</body>
+</html>
