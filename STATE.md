@@ -42,4 +42,4 @@ This is a small, coherent project — **NOT split into sub-projects**. One bound
 | P04 | Frontend: single-page HTML | ✅ DONE | (impl subagent) |
 | P05 | Server + launch script (server.py + run.sh) | ✅ DONE | (impl subagent) |
 | P06 | Shared extraction module (render.py) | ✅ DONE | (impl subagent) |
-| P07 | Tests + verification | ⬜ NOT STARTED | (verifier subagent) |
+| P07 | Tests + verification (CI + verification.md) | ✅ DONE | (verifier subagent) |
