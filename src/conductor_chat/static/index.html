@@ -26,9 +26,20 @@
   header .meta { color: var(--muted); font-size: 12px; }
   button { background: var(--row); color: var(--fg); border: 1px solid var(--border); padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 13px; }
   button:hover { background: var(--row-hover); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
   .controls { display: flex; gap: 10px; padding: 14px 20px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 49px; z-index: 4; }
-  .controls input[type="search"] { flex: 1 1 360px; min-width: 240px; padding: 8px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; }
+  .controls input[type="search"] { flex: 1 1 360px; min-width: 240px; padding: 8px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; transition: border-color 0.2s; }
+  /* While a search is in flight: dim and pulse the border on the input. Stays editable. */
+  .controls input[type="search"].searching {
+    border-color: var(--accent);
+    animation: search-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes search-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(122, 162, 247, 0.35); }
+    50%      { box-shadow: 0 0 0 4px rgba(122, 162, 247, 0.08); }
+  }
   .controls select { padding: 7px 9px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; }
+  .controls select:disabled { opacity: 0.5; cursor: not-allowed; }
   #results { padding: 12px 20px; }
   .row { background: var(--row); border: 1px solid var(--border); padding: 11px 14px; margin-bottom: 9px; border-radius: 5px; }
   .row:hover { background: var(--row-hover); }
@@ -44,12 +55,46 @@
   .snippet .term-label { color: var(--accent); margin-right: 6px; }
   mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0 2px; border-radius: 2px; }
   .row-actions { margin-top: 9px; }
+
+  /* Above-results live status line. Updated on every search lifecycle. */
+  .search-status {
+    padding: 10px 20px 0 20px;
+    color: var(--muted);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 18px;
+  }
+  .search-status.hidden { display: none; }
+  .search-status.error { color: var(--error); }
+  .search-status.ok    { color: var(--ok); }
+
+  /* Pure-CSS spinner. Visible only when .search-status carries .loading. */
+  .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Bottom status (kept for backward compatibility — still shows export status etc.) */
   .status { padding: 9px 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; position: sticky; bottom: 0; background: var(--bg); }
   .status.error { color: var(--error); }
   .status.ok { color: var(--ok); }
   .empty { color: var(--muted); padding: 20px; text-align: center; font-style: italic; }
-  .banner { padding: 8px 20px; background: #3a2a1a; color: #f7c878; font-size: 12px; border-bottom: 1px solid var(--border); }
+  .banner { padding: 8px 20px; background: #3a2a1a; color: #f7c878; font-size: 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 10px; }
   .banner.hidden { display: none; }
+  .banner .dismiss { background: transparent; border: 1px solid #6b4a1a; color: #f7c878; font-size: 11px; padding: 2px 8px; }
+  .banner .dismiss:hover { background: #4a3520; }
+  .perf-banner { background: #1a2a3a; color: #7aa2f7; border-bottom: 1px solid var(--border); }
+  .perf-banner .dismiss { border-color: #2d4a87; color: #7aa2f7; }
+  .perf-banner .dismiss:hover { background: #1f3050; }
 </style>
 </head>
 <body>
@@ -61,6 +106,10 @@
 </header>
 
 <div class="banner hidden" id="banner"></div>
+<div class="banner perf-banner hidden" id="perf-banner">
+  <span>Heads up: searches currently take 10-40s due to a known perf gap. FTS5 fix tracked at #2.</span>
+  <button class="dismiss" id="perf-banner-dismiss" title="Dismiss this notice">Dismiss</button>
+</div>
 
 <div class="controls">
   <input id="q" type="search" placeholder='type words to search (space = AND, "quoted" = exact phrase)' autocomplete="off" autofocus>
@@ -69,6 +118,8 @@
     <option value="">All workspaces</option>
   </select>
 </div>
+
+<div class="search-status hidden" id="search-status"></div>
 
 <div id="results"><div class="empty">loading…</div></div>
 
@@ -82,11 +133,18 @@ const elQ = $("#q");
 const elWs = $("#workspace");
 const elResults = $("#results");
 const elStatus = $("#status");
+const elSearchStatus = $("#search-status");
 const elMeta = $("#meta");
 const elBanner = $("#banner");
+const elPerfBanner = $("#perf-banner");
 
 let lastFetchToken = 0;
 let debounceTimer = null;
+// AbortController for the in-flight /api/sessions request. We abort the old one
+// when the user kicks off a new search, so slow requests don't pile up.
+let inflightController = null;
+
+const PERF_BANNER_KEY = "cchat-perf-banner-dismissed";
 
 // Parse search input into terms. Whitespace = AND; "double-quoted" = single term.
 function parseTerms(s) {
@@ -148,6 +206,37 @@ function setStatus(text, cls) {
   elStatus.textContent = text;
 }
 
+// Update the above-results live status line. cls one of: "", "loading", "ok", "error".
+// Pass null/empty text to hide.
+function setSearchStatus(text, cls) {
+  if (!text) {
+    elSearchStatus.className = "search-status hidden";
+    elSearchStatus.textContent = "";
+    return;
+  }
+  elSearchStatus.className = "search-status" + (cls ? " " + cls : "");
+  // Build spinner + text. innerHTML is fine here: text passes through escapeHtml.
+  if (cls === "loading") {
+    elSearchStatus.innerHTML = '<span class="spinner" aria-hidden="true"></span><span>' + escapeHtml(text) + '</span>';
+  } else {
+    elSearchStatus.textContent = text;
+  }
+}
+
+// Toggle the "search in progress" affordance: dim+pulse the input border,
+// disable the workspace dropdown, disable all visible Export buttons.
+function setSearchingUi(active) {
+  elQ.classList.toggle("searching", active);
+  elWs.disabled = active;
+  const exportBtns = elResults.querySelectorAll(".export-btn");
+  exportBtns.forEach((b) => {
+    // Don't override buttons that were already disabled for their own reasons
+    // (e.g. their own export in flight) — those have data-busy=1.
+    if (b.dataset.busy === "1") return;
+    b.disabled = active;
+  });
+}
+
 async function loadWorkspaces() {
   try {
     const ws = await fetchJson("/api/workspaces");
@@ -172,6 +261,14 @@ async function loadHealth() {
 }
 
 async function loadSessions() {
+  // Abort any in-flight request so the user's new query takes over immediately.
+  if (inflightController) {
+    inflightController.abort();
+    inflightController = null;
+  }
+  const controller = new AbortController();
+  inflightController = controller;
+
   const token = ++lastFetchToken;
   const terms = parseTerms(elQ.value);
   const wsid = elWs.value;
@@ -179,16 +276,41 @@ async function loadSessions() {
   for (const t of terms) params.push(["q", t]);
   if (wsid) params.push(["workspace", wsid]);
   const url = "/api/sessions" + (params.length ? "?" + buildQS(params) : "");
+
+  // Status line above results
+  if (terms.length) {
+    const shown = terms.map((t) => `"${t}"`).join(" + ");
+    setSearchStatus(`Searching for ${shown}…`, "loading");
+  } else {
+    setSearchStatus(null);
+  }
   setStatus(terms.length ? `Searching for ${terms.length} term(s)…` : "Loading…");
+  setSearchingUi(true);
+  const tStart = performance.now();
   try {
-    const data = await fetchJson(url);
-    if (token !== lastFetchToken) return; // stale response
+    const data = await fetchJson(url, { signal: controller.signal });
+    if (token !== lastFetchToken) return; // stale response (shouldn't fire since we abort, but defensive)
+    const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
     render(data, terms);
+    if (terms.length) {
+      const shown = terms.map((t) => `"${t}"`).join(" + ");
+      setSearchStatus(`Found ${data.length} match${data.length === 1 ? "" : "es"} for ${shown} in ${elapsed}s`, "ok");
+    } else {
+      setSearchStatus(null);
+    }
     setStatus(`${data.length} session(s)${terms.length ? " matching all terms" : ""}.`);
   } catch (e) {
+    // An aborted request is expected behaviour — caller already kicked off a new search.
+    if (e.name === "AbortError") return;
     if (token !== lastFetchToken) return;
     elResults.innerHTML = '<div class="empty">Error: ' + escapeHtml(e.message) + "</div>";
+    setSearchStatus("Search failed: " + e.message, "error");
     setStatus("Error: " + e.message, "error");
+  } finally {
+    if (inflightController === controller) {
+      inflightController = null;
+      setSearchingUi(false);
+    }
   }
 }
 
@@ -236,6 +358,7 @@ elResults.addEventListener("click", async (ev) => {
   if (!btn) return;
   const sid = btn.dataset.sid;
   btn.disabled = true;
+  btn.dataset.busy = "1";
   const oldLabel = btn.textContent;
   btn.textContent = "Exporting…";
   setStatus(`Exporting ${sid}…`);
@@ -248,10 +371,12 @@ elResults.addEventListener("click", async (ev) => {
     setStatus(`Wrote ${r.path} (${r.bytes} bytes, ${r.messages} msgs)`, "ok");
     try { await navigator.clipboard.writeText(r.path); } catch (_) {}
     btn.textContent = "Exported";
+    delete btn.dataset.busy;
   } catch (e) {
     setStatus("Export failed: " + e.message, "error");
     btn.textContent = oldLabel;
     btn.disabled = false;
+    delete btn.dataset.busy;
   }
 });
 
@@ -273,7 +398,19 @@ $("#refresh").addEventListener("click", () => {
 
 elWs.addEventListener("change", loadSessions);
 
+// Perf banner (issue #2) — dismissible, sticky via localStorage.
+function initPerfBanner() {
+  let dismissed = false;
+  try { dismissed = localStorage.getItem(PERF_BANNER_KEY) === "1"; } catch (_) {}
+  if (!dismissed) elPerfBanner.classList.remove("hidden");
+  $("#perf-banner-dismiss").addEventListener("click", () => {
+    elPerfBanner.classList.add("hidden");
+    try { localStorage.setItem(PERF_BANNER_KEY, "1"); } catch (_) {}
+  });
+}
+
 // Initial load
+initPerfBanner();
 loadHealth();
 loadWorkspaces();
 loadSessions();
