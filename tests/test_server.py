@@ -161,6 +161,15 @@ def test_export_writes_file(running_server):
     assert os.path.exists(body["path"])
     assert body["bytes"] > 0
     assert body["mode"] == "clean"
+    # Verify-step fields — the endpoint must confirm the file is real before
+    # returning success so the UI never lies about a not-yet-visible file.
+    assert body["verified"] is True
+    assert body["verified_size_bytes"] == body["bytes"]
+    # verified_size_bytes must match actual on-disk size too (defence in depth).
+    assert body["verified_size_bytes"] == os.path.getsize(body["path"])
+    assert isinstance(body["verified_at"], str) and body["verified_at"]
+    # ISO 8601 — sanity check: contains 'T' separator and a timezone offset/Z.
+    assert "T" in body["verified_at"]
 
 
 def test_export_unknown_session_400(running_server):
@@ -170,6 +179,58 @@ def test_export_unknown_session_400(running_server):
     )
     assert status == 400
     assert "error" in body
+
+
+def test_export_verify_fails_when_file_deleted_mid_flight(running_server, monkeypatch):
+    """Simulate the race where the file is gone by the time we re-stat.
+
+    We monkeypatch the server's verify-pause helper to delete the freshly
+    written file during the pause window between the first and second stat.
+    The endpoint must return 500 with the documented error shape — not
+    silently claim success.
+    """
+    import os as _os
+    from conductor_chat import server as _server
+
+    sid = "sA"
+    deleted = {"path": None}
+
+    original_sleep = _server.time.sleep
+
+    def _delete_during_pause(seconds):
+        # Find the just-written export file in the out_dir and delete it.
+        out_dir = running_server["out_dir"]
+        entries = sorted(_os.listdir(out_dir))
+        ours = [e for e in entries if e.startswith(f"conductor-chat-{sid}-") and e.endswith(".md")]
+        if ours:
+            # Newest one (lexicographic order matches timestamp order).
+            target = _os.path.join(out_dir, ours[-1])
+            try:
+                _os.remove(target)
+                deleted["path"] = target
+            except OSError:
+                pass
+        # Still sleep so the server's verify timing is unchanged.
+        original_sleep(seconds)
+
+    monkeypatch.setattr(_server.time, "sleep", _delete_during_pause)
+
+    status, body = _post_json(
+        running_server["base"] + "/api/export",
+        {"session_id": sid},
+    )
+    assert status == 500
+    assert "error" in body
+    assert "verify failed" in body["error"]
+    # Failure shape contract: path + expected_size + actual_size all present.
+    assert "path" in body
+    assert "expected_size" in body
+    assert "actual_size" in body
+    # The file we deleted should match what the error reports.
+    # Compare via realpath because macOS resolves /var -> /private/var, and
+    # export.export_session() returns the resolved path while listdir does not.
+    assert deleted["path"] is not None
+    assert os.path.realpath(body["path"]) == os.path.realpath(deleted["path"])
 
 
 def test_root_serves_html(running_server):
