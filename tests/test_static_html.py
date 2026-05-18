@@ -158,6 +158,54 @@ def test_index_contains_match_kind_field_reference():
     assert "match_kind" in html
 
 
+# -------- Feature A (id-lookup) + Feature B (toggle persistence)
+#          + Feature C (clickable session ID) --------
+
+
+def test_index_contains_chat_id_input():
+    html = _read_index()
+    assert 'id="chat-id"' in html
+    # Label copy the user sees.
+    assert "Chat ID:" in html
+    assert 'id="chat-id-clear"' in html
+
+
+def test_index_calls_lookup_endpoint():
+    html = _read_index()
+    # The JS must hit /api/sessions/lookup with the entered ID.
+    assert "/api/sessions/lookup" in html
+    assert "loadById" in html
+
+
+def test_index_contains_no_chat_with_that_id_copy():
+    html = _read_index()
+    # The required user-facing empty-state copy.
+    assert "No chat with that ID." in html
+
+
+def test_index_persists_exact_toggle_to_localstorage():
+    html = _read_index()
+    # The toggle's persistence key + the apply/init function names.
+    assert "cchat-exact-toggle" in html
+    assert "initExactToggle" in html
+    assert "applyExactToggle" in html
+
+
+def test_index_placeholder_strings_depend_on_toggle():
+    html = _read_index()
+    # Both placeholder variants must appear in the JS as constants.
+    assert "Type the exact phrase you remember" in html
+    assert "Type words; space = AND" in html
+
+
+def test_index_session_id_is_clickable_copyable():
+    html = _read_index()
+    # The .sid chip carries .copyable and a click-to-copy handler.
+    assert "sid copyable" in html
+    assert ".sid.copyable" in html
+    assert "navigator.clipboard.writeText" in html
+
+
 # -------- live (boot the server and curl /) --------
 
 

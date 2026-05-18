@@ -29,6 +29,15 @@
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   .controls { display: flex; gap: 10px; padding: 14px 20px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 49px; z-index: 4; }
   .controls input[type="search"] { flex: 1 1 360px; min-width: 240px; padding: 8px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; transition: border-color 0.2s; }
+  /* The chat-ID lookup row sits above the search controls. */
+  .id-lookup { display: flex; gap: 10px; padding: 12px 20px 0 20px; align-items: center; flex-wrap: wrap; background: var(--bg); }
+  .id-lookup label { color: var(--muted); font-size: 12px; }
+  .id-lookup input { flex: 1 1 360px; min-width: 240px; padding: 7px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .id-lookup .hint { color: var(--muted); font-size: 11px; }
+  /* Clickable session ID on result rows (click-to-copy). */
+  .sid.copyable { cursor: pointer; transition: color 0.15s, background 0.15s; padding: 1px 4px; border-radius: 3px; }
+  .sid.copyable:hover { background: var(--code-bg); color: var(--accent); }
+  .sid.copied { color: var(--ok) !important; }
   /* While a search is in flight: dim and pulse the border on the input. Stays editable. */
   .controls input[type="search"].searching {
     border-color: var(--accent);
@@ -122,12 +131,19 @@
   <button class="dismiss" id="perf-banner-dismiss" title="Dismiss this notice">Dismiss</button>
 </div>
 
+<div class="id-lookup">
+  <label for="chat-id">Chat ID:</label>
+  <input id="chat-id" type="text" placeholder="paste a full UUID or any prefix ≥8 chars to jump directly to a chat" autocomplete="off" spellcheck="false">
+  <button id="chat-id-clear" title="Clear the ID input">Clear ID</button>
+  <span class="hint">Independent of the search box.</span>
+</div>
+
 <div class="controls">
-  <input id="q" type="search" placeholder='type words to search (space = AND, "quoted" = exact phrase)' autocomplete="off" autofocus>
   <label class="exact-toggle" title="When ON, the entire input is sent as one phrase (no word splitting).">
     <input id="exact-toggle" type="checkbox">
     Exact phrase
   </label>
+  <input id="q" type="search" placeholder='Type words; space = AND' autocomplete="off" autofocus>
   <button id="clear">Clear</button>
   <select id="workspace">
     <option value="">All workspaces</option>
@@ -152,6 +168,7 @@ const elQ = $("#q");
 const elWs = $("#workspace");
 const elAcct = $("#account");
 const elExactToggle = $("#exact-toggle");
+const elChatId = $("#chat-id");
 const elResults = $("#results");
 const elStatus = $("#status");
 const elSearchStatus = $("#search-status");
@@ -164,11 +181,20 @@ let seenAccounts = new Set();
 
 let lastFetchToken = 0;
 let debounceTimer = null;
+let idDebounceTimer = null;
 // AbortController for the in-flight /api/sessions request. We abort the old one
 // when the user kicks off a new search, so slow requests don't pile up.
 let inflightController = null;
+let inflightLookupController = null;
 
 const PERF_BANNER_KEY = "cchat-perf-banner-dismissed";
+const EXACT_TOGGLE_KEY = "cchat-exact-toggle";
+const PLACEHOLDER_EXACT = "Type the exact phrase you remember";
+const PLACEHOLDER_AND = "Type words; space = AND";
+
+// Tracks which input owns the current results view: "search" or "id".
+// Used so /api/sessions and /api/sessions/lookup don't clobber each other.
+let activeMode = "search";
 
 // Parse search input into structured terms.
 //
@@ -306,10 +332,15 @@ async function loadHealth() {
 }
 
 async function loadSessions() {
+  activeMode = "search";
   // Abort any in-flight request so the user's new query takes over immediately.
   if (inflightController) {
     inflightController.abort();
     inflightController = null;
+  }
+  if (inflightLookupController) {
+    inflightLookupController.abort();
+    inflightLookupController = null;
   }
   const controller = new AbortController();
   inflightController = controller;
@@ -431,7 +462,7 @@ function render(sessions, terms) {
           <span class="model">${model}</span>
           <span class="age">${age}</span>
           <span class="mcount">${escapeHtml(mc)}</span>
-          <span class="sid">${sid}</span>
+          <span class="sid copyable" data-sid="${sid}" title="Click to copy chat ID">${sid}</span>
         </div>
         ${snippetsHtml}
         <div class="row-actions">
@@ -443,7 +474,102 @@ function render(sessions, terms) {
   elResults.innerHTML = parts.join("");
 }
 
+// Feature A — Chat ID lookup. Hits /api/sessions/lookup?id=<value>.
+// Renders results into the same list area; clears the search box's view.
+async function loadById() {
+  const raw = (elChatId.value || "").trim();
+  if (!raw) {
+    // ID box cleared. Don't auto-rerun a normal search — let the user choose.
+    if (activeMode === "id") {
+      elResults.innerHTML = '<div class="empty">Paste a Chat ID above, or use the search box below.</div>';
+      setSearchStatus(null);
+      setStatus("Ready.");
+    }
+    return;
+  }
+  if (raw.length < 8) {
+    elResults.innerHTML = '<div class="empty">Chat ID needs at least 8 characters.</div>';
+    setSearchStatus("ID too short — need 8+ characters.", "error");
+    setStatus("Ready.");
+    activeMode = "id";
+    return;
+  }
+
+  activeMode = "id";
+  // Cancel any in-flight search so its response doesn't overwrite our results.
+  if (inflightController) {
+    inflightController.abort();
+    inflightController = null;
+  }
+  if (inflightLookupController) {
+    inflightLookupController.abort();
+    inflightLookupController = null;
+  }
+  const controller = new AbortController();
+  inflightLookupController = controller;
+  const token = ++lastFetchToken;
+
+  const url = "/api/sessions/lookup?id=" + encodeURIComponent(raw);
+  setSearchStatus(`Looking up chat by id: ${raw}…`, "loading");
+  setStatus(`Looking up ${raw}…`);
+  setSearchingUi(true);
+  const tStart = performance.now();
+  try {
+    const data = await fetchJson(url, { signal: controller.signal });
+    if (token !== lastFetchToken) return;
+    const elapsed = ((performance.now() - tStart) / 1000).toFixed(2);
+    updateSeenAccounts(data);
+    if (data.length === 0) {
+      elResults.innerHTML = '<div class="empty">No chat with that ID.</div>';
+      setSearchStatus(`No chat with that ID. (${elapsed}s)`, "ok");
+      setStatus("No match.");
+    } else {
+      render(data, []);
+      const label = data.length === 1 ? "1 match" : `${data.length} matches`;
+      setSearchStatus(`Found ${label} for id ${raw} in ${elapsed}s`, "ok");
+      setStatus(`${data.length} session(s) by ID.`);
+    }
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    if (token !== lastFetchToken) return;
+    elResults.innerHTML = '<div class="empty">Error: ' + escapeHtml(e.message) + "</div>";
+    setSearchStatus("Lookup failed: " + e.message, "error");
+    setStatus("Error: " + e.message, "error");
+  } finally {
+    if (inflightLookupController === controller) {
+      inflightLookupController = null;
+      setSearchingUi(false);
+    }
+  }
+}
+
+// Apply persisted exact-phrase toggle state and keep the placeholder in sync.
+function applyExactToggle() {
+  elQ.placeholder = elExactToggle.checked ? PLACEHOLDER_EXACT : PLACEHOLDER_AND;
+}
+
+function initExactToggle() {
+  let saved = null;
+  try { saved = localStorage.getItem(EXACT_TOGGLE_KEY); } catch (_) {}
+  if (saved === "1") elExactToggle.checked = true;
+  applyExactToggle();
+}
+
 elResults.addEventListener("click", async (ev) => {
+  // Click-to-copy on the session id chip.
+  const sidEl = ev.target.closest(".sid.copyable");
+  if (sidEl) {
+    const sid = sidEl.dataset.sid || sidEl.textContent;
+    try { await navigator.clipboard.writeText(sid); } catch (_) {}
+    sidEl.classList.add("copied");
+    const prev = sidEl.textContent;
+    sidEl.textContent = "copied ✓";
+    setTimeout(() => {
+      sidEl.classList.remove("copied");
+      sidEl.textContent = prev;
+    }, 900);
+    return;
+  }
   const btn = ev.target.closest(".export-btn");
   if (!btn) return;
   const sid = btn.dataset.sid;
@@ -471,8 +597,30 @@ elResults.addEventListener("click", async (ev) => {
 });
 
 elQ.addEventListener("input", () => {
+  // Using the search box clears the ID-lookup view so the two never collide.
+  if (elChatId.value) {
+    elChatId.value = "";
+  }
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(loadSessions, 200);
+});
+
+elChatId.addEventListener("input", () => {
+  clearTimeout(idDebounceTimer);
+  idDebounceTimer = setTimeout(loadById, 150);
+});
+
+elChatId.addEventListener("paste", () => {
+  // Trigger a near-immediate lookup after paste.
+  clearTimeout(idDebounceTimer);
+  idDebounceTimer = setTimeout(loadById, 30);
+});
+
+$("#chat-id-clear").addEventListener("click", () => {
+  elChatId.value = "";
+  // Restore the regular search results view.
+  loadSessions();
+  elChatId.focus();
 });
 
 $("#clear").addEventListener("click", () => {
@@ -483,12 +631,27 @@ $("#clear").addEventListener("click", () => {
 
 $("#refresh").addEventListener("click", () => {
   loadHealth();
-  loadSessions();
+  if (activeMode === "id" && elChatId.value.trim()) {
+    loadById();
+  } else {
+    loadSessions();
+  }
 });
 
-elWs.addEventListener("change", loadSessions);
-elAcct.addEventListener("change", loadSessions);
-elExactToggle.addEventListener("change", loadSessions);
+elWs.addEventListener("change", () => {
+  if (activeMode === "id") return; // workspace filter doesn't apply to ID lookup
+  loadSessions();
+});
+elAcct.addEventListener("change", () => {
+  if (activeMode === "id") return;
+  loadSessions();
+});
+elExactToggle.addEventListener("change", () => {
+  // Persist + update placeholder, then re-run search.
+  try { localStorage.setItem(EXACT_TOGGLE_KEY, elExactToggle.checked ? "1" : "0"); } catch (_) {}
+  applyExactToggle();
+  loadSessions();
+});
 
 // Perf banner (issue #2) — dismissible, sticky via localStorage.
 function initPerfBanner() {
@@ -503,6 +666,7 @@ function initPerfBanner() {
 
 // Initial load
 initPerfBanner();
+initExactToggle();
 loadHealth();
 loadWorkspaces();
 loadSessions();
