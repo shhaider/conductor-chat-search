@@ -100,6 +100,81 @@ def get_session(con: sqlite3.Connection, session_id: str) -> dict[str, Any] | No
     return dict(row) if row else None
 
 
+def lookup_sessions_by_id(
+    con: sqlite3.Connection,
+    id_value: str,
+    limit: int = 50,
+    account_index: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return non-hidden sessions whose id matches ``id_value``.
+
+    Resolution rules:
+      - Exact UUID-shaped match (length 36 with hyphens) -> equality lookup,
+        returns 0 or 1 row.
+      - Otherwise -> prefix lookup ``id LIKE '<id_value>%'`` so that the
+        operator can paste any 8+ char prefix and still land on the chat.
+
+    Each dict carries the same shape as ``list_sessions`` rows:
+    session_id, title, workspace_id, workspace_name, model, agent_type,
+    created_at, updated_at, last_user_message_at, context_used_percent,
+    context_token_count, message_count, account.
+
+    The caller is responsible for length validation (>=8 chars). An empty
+    ``id_value`` returns an empty list without touching the DB.
+    """
+    if not id_value:
+        return []
+    # Exact UUID form: 36 chars + hyphens at fixed positions.
+    is_uuid_shape = (
+        len(id_value) == 36
+        and id_value[8] == "-"
+        and id_value[13] == "-"
+        and id_value[18] == "-"
+        and id_value[23] == "-"
+    )
+    if is_uuid_shape:
+        where_clause = "s.id = ?"
+        params: tuple[Any, ...] = (id_value,)
+    else:
+        # Prefix LIKE — escape any user-supplied wildcards so '%foo' can't
+        # become a glob match.
+        escaped = id_value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where_clause = "s.id LIKE ? ESCAPE '\\'"
+        params = (escaped + "%",)
+
+    rows = con.execute(
+        f"""
+        SELECT s.id AS session_id,
+               s.title AS title,
+               s.workspace_id AS workspace_id,
+               w.directory_name AS workspace_name,
+               s.model AS model,
+               s.agent_type AS agent_type,
+               s.created_at AS created_at,
+               s.updated_at AS updated_at,
+               s.last_user_message_at AS last_user_message_at,
+               s.context_used_percent AS context_used_percent,
+               s.context_token_count AS context_token_count,
+               (SELECT COUNT(*) FROM session_messages m WHERE m.session_id = s.id)
+                   AS message_count
+        FROM sessions s
+        LEFT JOIN workspaces w ON w.id = s.workspace_id
+        WHERE s.is_hidden = 0
+          AND {where_clause}
+        ORDER BY s.updated_at DESC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    result = [dict(r) for r in rows]
+    for r in result:
+        sid = r.get("session_id")
+        r["account"] = (
+            account_index.get(sid) if (account_index and sid is not None) else None
+        )
+    return result
+
+
 def get_session_messages(con: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     """Return all messages for a session ordered by sent_at ASC, rowid ASC."""
     rows = con.execute(

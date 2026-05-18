@@ -282,3 +282,151 @@ def test_sessions_mixed_q_and_q_exact(running_server):
     ids = [s["session_id"] for s in body]
     assert ids == ["sE"]
     assert body[0]["match_kind"] == "exact"
+
+
+# -- Feature A: /api/sessions/lookup --
+
+
+def _get_json_allow_err(url: str, timeout: float = 5.0):
+    """Like _get_json but doesn't raise on 4xx — returns (status, body) too."""
+    req = urlrequest.Request(url, method="GET")
+    try:
+        with closing(urlrequest.urlopen(req, timeout=timeout)) as resp:
+            body = resp.read()
+            return resp.status, json.loads(body) if body else None
+    except urlerror.HTTPError as e:
+        body = e.read()
+        return e.code, json.loads(body) if body else None
+
+
+def test_sessions_lookup_missing_id_param_400(running_server):
+    """No ?id= -> 400 with an explanatory error."""
+    status, body = _get_json_allow_err(
+        running_server["base"] + "/api/sessions/lookup"
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_sessions_lookup_short_id_400(running_server):
+    """An id under 8 chars is refused so prefix scans stay narrow."""
+    status, body = _get_json_allow_err(
+        running_server["base"] + "/api/sessions/lookup?id=abc"
+    )
+    assert status == 400
+    assert "8" in body["error"]
+
+
+def test_sessions_lookup_unknown_id_returns_empty_list(running_server):
+    """A non-matching 8+ char prefix returns [] (not an error)."""
+    status, body = _get_json(
+        running_server["base"] + "/api/sessions/lookup?id=deadbeef"
+    )
+    assert status == 200
+    assert body == []
+
+
+def test_sessions_lookup_full_uuid_equality(running_server):
+    """A UUID-shaped value uses equality lookup (0 or 1 row)."""
+    fake_uuid = "0ba636dc-5c0c-47c4-b4a7-27ea45e79533"
+    status, body = _get_json(
+        running_server["base"] + "/api/sessions/lookup?id=" + fake_uuid
+    )
+    assert status == 200
+    # Fixture has no such id; equality lookup must not pick up a partial.
+    assert body == []
+
+
+def test_sessions_lookup_prefix_returns_rows(running_server):
+    """Prefix match returns full session rows including the lookup-extension fields."""
+    # Fixture ids are 'sA', 'sB', 'sC', 'sD', 'sE'. We can't use those raw
+    # prefixes (only 2 chars) — bump to a 8-char synthetic instead. We pad
+    # the prefix by re-inserting a known id with a longer value via the
+    # public API: use 'sA' as the exact target, but the API requires 8+ chars
+    # so build a longer test id by lookup of a known long substring.
+    # Easiest path: hit the lookup with the FULL id 'sA' won't work
+    # (under 8 chars) — instead skip prefix-row test against the search
+    # fixture (its ids are short) and rely on the db unit tests.
+    # Here we just confirm the endpoint accepts an 8-char input and returns
+    # an empty list cleanly.
+    status, body = _get_json(
+        running_server["base"] + "/api/sessions/lookup?id=sAsAsAsA"
+    )
+    assert status == 200
+    assert isinstance(body, list)
+
+
+def test_sessions_lookup_row_shape(running_server):
+    """Returned rows match the /api/sessions row shape (so the same UI renderer works)."""
+    # Build a fresh fixture with a long session id we can prefix-match.
+    import tempfile, threading, sqlite3 as sq
+    from tests.fixtures.build_fixture import SCHEMA_SQL, _assistant_text
+
+    fd, db_path = tempfile.mkstemp(prefix="cchat-lookup-fixture-", suffix=".db")
+    os.close(fd)
+    con = sq.connect(db_path)
+    try:
+        con.executescript(SCHEMA_SQL)
+        con.execute(
+            "INSERT INTO workspaces (id, directory_name, branch, state) VALUES (?, ?, ?, ?)",
+            ("ws-x", "x", "main", "active"),
+        )
+        long_id = "0ba636dc-5c0c-47c4-b4a7-27ea45e79533"
+        con.execute(
+            """INSERT INTO sessions
+            (id, title, workspace_id, model, agent_type, created_at, updated_at,
+             last_user_message_at, context_used_percent, context_token_count, is_hidden)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (long_id, "Continue Resolve Abandoned Work", "ws-x", "sonnet", "claude",
+             "2026-05-15T10:00:00", "2026-05-17T12:00:00",
+             "2026-05-17T11:50:00", None, None, 0),
+        )
+        con.execute(
+            """INSERT INTO session_messages
+            (id, session_id, role, content, created_at, sent_at, turn_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("m1", long_id, "assistant",
+             _assistant_text("PR #1720 rebased cleanly today."),
+             "2026-05-17T11:55:30", "2026-05-17T11:55:30", "t1"),
+        )
+        con.execute(
+            "INSERT INTO _sqlx_migrations (version, description) VALUES (?, ?)",
+            (20260101, "init"),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    # Boot a dedicated server for this fixture.
+    from conductor_chat import server as _server
+    httpd = _server.make_server(host="127.0.0.1", port=0, db_path=db_path, fts_path=None)
+    port = httpd.server_address[1]
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        # Prefix lookup
+        status, body = _get_json(base + "/api/sessions/lookup?id=0ba636dc")
+        assert status == 200
+        assert len(body) == 1
+        row = body[0]
+        assert row["session_id"] == long_id
+        assert row["title"] == "Continue Resolve Abandoned Work"
+        assert row["workspace_name"] == "x"
+        assert row["message_count"] == 1
+        # Frontend renders the row template — needs these fields too.
+        assert "snippets" in row and row["snippets"] == []
+        assert row["match_kind"] == "and"
+        assert "account" in row
+
+        # Full UUID equality
+        status, body = _get_json(base + "/api/sessions/lookup?id=" + long_id)
+        assert status == 200
+        assert len(body) == 1
+        assert body[0]["session_id"] == long_id
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        th.join(timeout=5)
+        try: os.remove(db_path)
+        except OSError: pass

@@ -80,6 +80,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/workspaces":
             self._handle_workspaces()
             return
+        if path == "/api/sessions/lookup":
+            self._handle_sessions_lookup(
+                parse_qs(parsed.query, keep_blank_values=False)
+            )
+            return
         if path == "/api/sessions":
             self._handle_sessions(parse_qs(parsed.query, keep_blank_values=False))
             return
@@ -160,6 +165,42 @@ class Handler(BaseHTTPRequestHandler):
             if fts_con is not None:
                 fts_con.close()
         result = accounts.filter_by_account(result, account_filter)
+        self._send_json(200, result)
+
+    def _handle_sessions_lookup(self, qs: dict[str, list[str]]) -> None:
+        """Resolve a chat by id or id prefix.
+
+        ``?id=<value>``:
+          - Full UUID (36 chars) -> equality lookup.
+          - 8+ char prefix -> ``id LIKE '<value>%'``.
+          - <8 chars or missing -> 400 with explanatory error.
+        Returns a JSON list of session rows (same shape as ``/api/sessions``).
+        Empty list means "no chat with that id".
+        """
+        id_list = qs.get("id", [])
+        id_value = (id_list[0] if id_list else "").strip()
+        if not id_value:
+            self._send_json(400, {"error": "id query param required"})
+            return
+        # Minimum prefix length; UUIDs that are 36 chars are fine.
+        if len(id_value) < 8:
+            self._send_json(
+                400,
+                {"error": "id must be at least 8 characters (UUID prefix)"},
+            )
+            return
+        con = db.open_ro(self.db_path)
+        try:
+            result = db.lookup_sessions_by_id(
+                con, id_value, account_index=self.account_index
+            )
+        finally:
+            con.close()
+        # Decorate with empty snippets / match_kind so the frontend's render()
+        # can reuse the same row template as the search results path.
+        for r in result:
+            r["snippets"] = []
+            r["match_kind"] = "and"
         self._send_json(200, result)
 
     def _handle_export(self) -> None:

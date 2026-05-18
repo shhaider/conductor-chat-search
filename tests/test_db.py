@@ -130,3 +130,103 @@ def test_readonly_writes_blocked(fixture_db):
             con.execute("DELETE FROM sessions WHERE id = 's1'")
     finally:
         con.close()
+
+
+# -- lookup_sessions_by_id (Feature A) --
+
+
+def test_lookup_by_id_empty_value(fixture_db):
+    con = db.open_ro(fixture_db)
+    try:
+        assert db.lookup_sessions_by_id(con, "") == []
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_prefix_match(fixture_db):
+    """An 8+ char prefix returns every visible session whose id starts with it."""
+    con = db.open_ro(fixture_db)
+    try:
+        # Fixture ids are 's1', 's2', 's3'. Use 's' prefix as the lookup —
+        # the function does prefix matching for any non-UUID-shaped value.
+        rows = db.lookup_sessions_by_id(con, "s")
+        ids = sorted(r["session_id"] for r in rows)
+        assert ids == ["s1", "s2"]  # s3 is hidden
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_no_match(fixture_db):
+    con = db.open_ro(fixture_db)
+    try:
+        assert db.lookup_sessions_by_id(con, "deadbeef-no-such-id") == []
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_exact_match_carries_row_shape(fixture_db):
+    """Returned rows carry the standard list_sessions shape: title, workspace_name, message_count, account."""
+    con = db.open_ro(fixture_db)
+    try:
+        rows = db.lookup_sessions_by_id(con, "s1")
+        assert len(rows) == 1
+        r = rows[0]
+        for key in (
+            "session_id", "title", "workspace_id", "workspace_name",
+            "model", "agent_type", "created_at", "updated_at",
+            "message_count", "account",
+        ):
+            assert key in r, f"missing key {key!r}"
+        assert r["title"] == "First session"
+        assert r["workspace_name"] == "alpha"
+        assert r["message_count"] == 2
+        assert r["account"] is None  # no index passed
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_does_not_return_hidden_sessions(fixture_db):
+    """is_hidden=1 sessions stay hidden even when the id matches exactly."""
+    con = db.open_ro(fixture_db)
+    try:
+        # s3 is hidden in the default fixture.
+        rows = db.lookup_sessions_by_id(con, "s3")
+        assert rows == []
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_uuid_shape_uses_equality(fixture_db):
+    """A UUID-shaped value (36 chars, 4 hyphens) returns 0 or 1 row, never partial."""
+    con = db.open_ro(fixture_db)
+    try:
+        # Synthetic UUID — no row matches.
+        rows = db.lookup_sessions_by_id(con, "deadbeef-1234-5678-9abc-def012345678")
+        assert rows == []
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_escapes_wildcards(fixture_db):
+    """User-supplied % or _ chars are escaped so they don't become globs."""
+    con = db.open_ro(fixture_db)
+    try:
+        # '%' would otherwise match everything; we expect zero matches.
+        rows = db.lookup_sessions_by_id(con, "%")
+        assert rows == []
+        rows = db.lookup_sessions_by_id(con, "_1")
+        assert rows == []  # literal underscore — fixture ids have none
+    finally:
+        con.close()
+
+
+def test_lookup_by_id_carries_account_when_index_provided(fixture_db):
+    con = db.open_ro(fixture_db)
+    try:
+        rows = db.lookup_sessions_by_id(
+            con, "s1", account_index={"s1": "account2"}
+        )
+        assert len(rows) == 1
+        assert rows[0]["account"] == "account2"
+    finally:
+        con.close()

@@ -164,6 +164,9 @@ def search(
             messages = db.get_messages_by_ids(con, sid, list(msg_ids_needed))
 
         confirmed_snippets: list[dict[str, Any]] = []
+        # Per-message confirmation map: msg_id -> set(term_value) so we can
+        # detect "all words appear inside the SAME message" co-occurrence.
+        per_msg_term_hits: dict[str, set[str]] = {}
         all_terms_confirmed = True
         for term in structured:
             term_snippet: dict[str, Any] | None = None
@@ -171,8 +174,11 @@ def search(
                 ok, snippet = _confirm_term_in_text_blocks(msg, term["value"])
                 if ok:
                     snippet["exact"] = term["exact"]
-                    term_snippet = snippet
-                    break
+                    if term_snippet is None:
+                        term_snippet = snippet
+                    mid = msg.get("id") or ""
+                    if mid:
+                        per_msg_term_hits.setdefault(mid, set()).add(term["value"])
             if term_snippet is None:
                 all_terms_confirmed = False
                 break
@@ -181,14 +187,26 @@ def search(
             row = dict(session_index[sid])
             row["snippets"] = confirmed_snippets
             row["match_kind"] = "exact" if has_any_exact else "and"
+            # Co-occurrence flag: every term landed in at least one common
+            # message. Used to rank above scattered-across-messages hits.
+            term_values_needed = {t["value"] for t in structured}
+            row["all_in_one_message"] = any(
+                term_values_needed.issubset(hits)
+                for hits in per_msg_term_hits.values()
+            )
             results.append(row)
 
-    # Preserve list_sessions ordering (updated_at DESC) within each match-kind
-    # group; exact-phrase results come first.
+    # Preserve list_sessions ordering (updated_at DESC) within each group;
+    # ordering keys (lower sorts first):
+    #   1. match_kind == "exact" (phrase hit) — top
+    #   2. AND-of-words with every term in a single message — next
+    #   3. AND-of-words scattered across messages — last
+    # Within each group: updated_at DESC.
     sid_to_order = {s["session_id"]: i for i, s in enumerate(all_sessions)}
     results.sort(
         key=lambda r: (
-            0 if r["match_kind"] == "exact" else 1,
+            0 if r["match_kind"] == "exact"
+            else (1 if r.get("all_in_one_message") else 2),
             sid_to_order.get(r["session_id"], 1_000_000),
         )
     )
