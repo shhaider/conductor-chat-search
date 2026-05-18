@@ -14,6 +14,7 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -230,6 +231,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         finally:
             con.close()
+
+        # Verify step: confirm the file is actually visible at the returned
+        # path before claiming success. The UI used to flip to "Exported"
+        # ~500ms before Finder/Spotlight could see the file. We stat,
+        # short-pause, re-stat, and check the first 100 bytes for the
+        # markdown header. If anything is off, return 500 so the frontend
+        # doesn't lie.
+        verified = _verify_export(result["path"], result["bytes"])
+        if not verified["ok"]:
+            self._send_json(500, verified["error"])
+            return
+        result["verified"] = True
+        result["verified_size_bytes"] = verified["size"]
+        result["verified_at"] = verified["at"]
         self._send_json(200, result)
 
     # ---- response helpers ----
@@ -295,6 +310,88 @@ def _guess_content_type(rel: str) -> str:
     if rel.endswith(".json"):
         return "application/json; charset=utf-8"
     return "application/octet-stream"
+
+
+# How long to pause between the two stat calls. Short enough to be invisible
+# to the user, long enough that a half-written file would either finish or
+# fail visibly. 50ms matches the spec.
+_VERIFY_PAUSE_S = 0.05
+
+
+def _verify_export(path: str, expected_size: int) -> dict[str, Any]:
+    """Confirm that ``path`` is a real file at least ``expected_size`` bytes
+    long, with the markdown frontmatter at the head.
+
+    Returns ``{"ok": True, "size": int, "at": iso}`` on success or
+    ``{"ok": False, "error": {...}}`` on failure. The error dict matches the
+    spec's failure shape: ``{error, path, expected_size, actual_size}``.
+
+    The flow is:
+      1. ``os.stat`` — fails fast if the file vanished before we got here.
+      2. brief sleep (50ms) — gives any pending fs/cache work a moment.
+      3. second ``os.stat`` — confirms the file is still there with the
+         expected size.
+      4. read first 100 bytes — confirms the markdown header ('# ') is
+         present so we know it isn't a half-written truncated file.
+    """
+    try:
+        st1 = os.stat(path)
+    except OSError as e:
+        return {"ok": False, "error": {
+            "error": f"verify failed: file not found ({e})",
+            "path": path,
+            "expected_size": expected_size,
+            "actual_size": 0,
+        }}
+    if st1.st_size <= 0:
+        return {"ok": False, "error": {
+            "error": "verify failed: file is empty",
+            "path": path,
+            "expected_size": expected_size,
+            "actual_size": st1.st_size,
+        }}
+    time.sleep(_VERIFY_PAUSE_S)
+    try:
+        st2 = os.stat(path)
+    except OSError as e:
+        return {"ok": False, "error": {
+            "error": f"verify failed: file disappeared between stats ({e})",
+            "path": path,
+            "expected_size": expected_size,
+            "actual_size": 0,
+        }}
+    if st2.st_size != expected_size:
+        return {"ok": False, "error": {
+            "error": "verify failed: size mismatch",
+            "path": path,
+            "expected_size": expected_size,
+            "actual_size": st2.st_size,
+        }}
+    # Optional content sanity check — head of the file should start with the
+    # markdown frontmatter / header. render.render_session_header always emits
+    # a '# <title>' line as the first non-frontmatter line.
+    try:
+        with open(path, "rb") as f:
+            head = f.read(100)
+    except OSError as e:
+        return {"ok": False, "error": {
+            "error": f"verify failed: could not read head ({e})",
+            "path": path,
+            "expected_size": expected_size,
+            "actual_size": st2.st_size,
+        }}
+    # The rendered export always begins with a markdown heading or frontmatter
+    # '---' line; either form starts with '#' or '-'. If neither is present in
+    # the first 100 bytes, the file is wrong.
+    if not head.lstrip().startswith((b"#", b"-")):
+        return {"ok": False, "error": {
+            "error": "verify failed: unexpected file head (no markdown header)",
+            "path": path,
+            "expected_size": expected_size,
+            "actual_size": st2.st_size,
+        }}
+    iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
+    return {"ok": True, "size": st2.st_size, "at": iso}
 
 
 # -- server factory + CLI --

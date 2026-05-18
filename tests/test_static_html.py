@@ -206,6 +206,41 @@ def test_index_session_id_is_clickable_copyable():
     assert "navigator.clipboard.writeText" in html
 
 
+# -------- Export verify flow (this branch) --------
+
+
+def test_index_export_button_states_present():
+    """All four button-state labels for the verified export flow must be in the JS source."""
+    html = _read_index()
+    assert "Exporting…" in html
+    assert "Verifying…" in html
+    assert "✓ Exported" in html
+    assert "✗ Export failed" in html
+
+
+def test_index_export_button_uses_verified_response():
+    """The frontend gates the 'Exported' state on the server's verified=true field."""
+    html = _read_index()
+    # Reads the verified flag from the JSON response.
+    assert "r.verified" in html
+    # Surfaces the verified size to the user.
+    assert "verified_size_bytes" in html
+
+
+def test_index_export_button_has_inline_spinner_css():
+    """Pure-CSS spinner sits inside the button while the export is in flight."""
+    html = _read_index()
+    assert ".btn-spinner" in html
+    assert ".export-btn" in html
+
+
+def test_index_export_button_shows_path_below():
+    """On verified success the rendered path appears beneath the button."""
+    html = _read_index()
+    assert ".export-path" in html
+    assert "export-path" in html  # also referenced by class= in JS
+
+
 # -------- live (boot the server and curl /) --------
 
 
