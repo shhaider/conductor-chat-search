@@ -1,94 +1,156 @@
-# Live Validation Report — v0.1.0
+# Live Validation Report — id-lookup + search-toggle + click-to-copy
 
-**Commit:** `60d4402` (top of `feature/v0.1.0`)
-**PR:** https://github.com/shhaider/conductor-chat-search/pull/1
-**Run date:** 2026-05-17
-**Runtime environment:** macOS, M-series, Python 3.14
-**Real data:** `~/Library/Application Support/com.conductor.app/conductor.db` — 49 workspaces, 79 visible sessions, ~329k messages
+**Merge commit:** `da679e6` on `main` (squash of PRs #7, #8, #9).
+**PRs:**
+- https://github.com/shhaider/conductor-chat-search/pull/7 — feat: chat-ID lookup + persisted exact-phrase toggle + click-to-copy IDs
+- https://github.com/shhaider/conductor-chat-search/pull/8 — fix(lookup): include hidden chats in ID lookup
+- https://github.com/shhaider/conductor-chat-search/pull/9 — fix(search): include hidden chats in query results
 
-## Definition of done — per operator rules
+**Run date:** 2026-05-18
+**Runtime environment:** macOS, Python 3.14, PYTHONPATH=src, port 17891
+**Real data:** `~/Library/Application Support/com.conductor.app/conductor.db` — 3000+ sessions, ~647k+ FTS rows.
+**Server process:** restarted post-merge against the freshly pulled `main` checkout.
 
-> Completion requires post-merge validation of the actual running artifact in the target environment.
-> Validate through realistic end-to-end user journeys, inspect outputs for semantic/qualitative correctness,
-> verify internal state and downstream side effects, test happy-path + edge/failure cases, collect evidence,
-> clean up test artifacts, produce a validation report tied to the deployed commit/build.
+## Server bring-up
 
-## Journeys executed
+```bash
+$ kill "$(cat /tmp/cchat-server.pid)"
+$ PYTHONPATH=src nohup python3 -m conductor_chat.server --port 17891 --no-open > /tmp/cchat-server.log 2>&1 &
+$ tail -3 /tmp/cchat-server.log
+Account index built: 3011 session(s) across 4 Claude account dir(s)
+Conductor Chat Search listening at http://127.0.0.1:17891/
+Ctrl-C to stop.
+```
 
-| # | Journey | Pass | Evidence |
-|---|---|---|---|
-| 1 | Server starts against real conductor.db on auto port | ✅ | `URL: http://127.0.0.1:61583` printed within 1.5s |
-| 2 | `/api/health` returns OK + schema_version | ✅ | `{ok: true, schema_version: "103", schema_warning: "Untested..."}` — soft-warn working |
-| 3 | `/api/workspaces` returns real workspaces | ✅ | 49 workspaces returned; matches DB count |
-| 4 | `/api/sessions` (no filter) returns recent sessions | ✅ | 79 sessions, ordered by updated_at DESC; titles + workspace_name joined |
-| 5 | Search for "metabuilder" returns matches with snippets | ✅ (functionally) ❌ (perf) | 40 matches, snippets correctly highlight `«metabuilder»`. Took **59.6s** — spec is <2s (A7 FAIL). |
-| 6 | AND search "metabuilder" + "telegram" narrows | ✅ | 0 matches — semantically correct (no Conductor chat discusses both) |
-| 7 | Empty result on bogus term | ✅ | `xyzzy_zzz_no_chance_match` → 0 matches |
-| 8 | Path traversal blocked | ✅ | `/static/../etc/passwd` → HTTP 404 `{error: not_found}` |
-| 9 | Unknown session_id rejected | ✅ | POST `/api/export` with bogus id → HTTP 400 `{error: "unknown session_id: ..."}` |
-| 10 | Rare-term search performance | ⚠️ partial | `q=hetzner` → 0 matches in 6.9s. Still slow but matches expected; A7 still misses target |
-| 11 | AND with two rare terms | ⚠️ partial | `q=hetzner&q=redis` → 0 matches in 15.9s |
-| 12 | Workspace filter | ✅ | `workspace=<caracas-id>` → 3 sessions (caracas-only); matches manual count |
-| 13 | End-to-end export to ~/Downloads | ✅ | Real session (2254 messages) → 547KB markdown at `/Users/syedhaider/Downloads/conductor-chat-...md`. File contains 2274 `## ` headings (one per message + header), header has correct session_id/title/workspace/model/timestamps |
+## Check 1 — UI: ID input field appears in the HTML
 
-**Score: 11 pass, 0 functional fail, 1 perf fail (A7), 2 edge cases with degraded perf but correct results.**
+```
+$ curl -s -o /tmp/cchat-index.html -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" http://127.0.0.1:17891/
+HTTP=200 bytes=27258 time=0.003819s
+$ grep -c 'id="chat-id"' /tmp/cchat-index.html
+1
+$ grep -c 'Chat ID:' /tmp/cchat-index.html
+1
+```
 
-## What works (operator can use today)
+**PASS** — 200 in 4ms, 1 input with `id="chat-id"`, label "Chat ID:" present.
 
-- Listing all sessions with workspace + msg count ordered by recency.
-- Filtering by workspace (e.g. just see "caracas" chats).
-- Searching for rare/specific terms (under 7s when matches are rare).
-- AND-narrowing across multiple terms (semantics correct).
-- Path traversal + unknown-id error handling.
-- Exporting any selected chat to `~/Downloads/` as a complete markdown transcript that matches the existing CLI's clean-mode format (operator already eyeballed and accepts that format).
+## Check 2 — UI: exact-phrase toggle + persistence
 
-## What's broken / off-spec
+```
+$ grep -c 'id="exact-toggle"' /tmp/cchat-index.html
+1
+$ grep -c 'Exact phrase' /tmp/cchat-index.html
+2
+$ grep -c 'cchat-exact-toggle' /tmp/cchat-index.html
+1
+$ grep -c 'Type the exact phrase you remember' /tmp/cchat-index.html
+1
+$ grep -c 'Type words; space = AND' /tmp/cchat-index.html
+2
+```
 
-**A7 performance — FAIL.**
+**PASS** — toggle present, label "Exact phrase" rendered, localStorage key
+`cchat-exact-toggle` referenced, both placeholder strings emitted as JS
+constants (one ON variant, two OFF references including default attr).
 
-The two-pass strategy (SQL `LIKE '%term%' → Python JSON-parse confirm) is too slow against 329k JSON-encoded rows where `content` is often multi-KB. Common terms ("metabuilder") take ~60s. The acceptance criterion was <2s.
+## Check 3 — API: 8-char prefix lookup
 
-Behavior is *correct* — just slow. For a "find the chat I want among 79 sessions" rescue use case, 60s per search is workable but painful. Will block "scan-as-you-type" debounced UX from feeling responsive.
+```
+$ curl -s -o /tmp/cchat-c3.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
+    "http://127.0.0.1:17891/api/sessions/lookup?id=0ba636dc"
+HTTP=200 bytes=518 time=0.014646s
+$ jq . /tmp/cchat-c3.json
+[
+  {
+    "session_id": "0ba636dc-5c0c-47c4-b4a7-27ea45e79533",
+    "title": "Continue Resolve Abandoned Work",
+    "workspace_id": "d4832e8f-c93a-4be8-8a8e-6dff0c12d85c",
+    "workspace_name": "oslo",
+    "model": "sonnet",
+    "agent_type": "claude",
+    "context_token_count": 136138,
+    "is_hidden": 1,
+    "message_count": 5333,
+    "account": "account3",
+    "snippets": [],
+    "match_kind": "and"
+  }
+]
+```
 
-**Root cause:** SQL `LIKE` with leading wildcard skips all indexes; SQLite must do a full table scan of 329k rows AND read the full `content` column (avg multi-KB) for each. Python pass then JSON-parses every candidate. Total work ~= 2-3 GB scanned linearly.
+**PASS** — 200 in 15ms, exactly 1 match, the chat the user lost track of
+(`Continue Resolve Abandoned Work` in workspace `oslo`). The chat has
+`is_hidden=1` — this was the silent reason the user couldn't find it via
+the search box (PRs #8 and #9 fixed both lookup and search to surface
+hidden chats).
 
-**Fix path:** Replace `LIKE` pre-filter with a SQLite FTS5 virtual table. Index just the user+assistant `text` fields (not raw JSON). Initial index build is one-time ~30s; subsequent queries should be ≤100ms. The architecture already anticipated this — RESEARCH.md flagged FTS5 as the upgrade and ARCHITECTURE.md noted "revisit if A7 misses".
+## Check 4 — API: full UUID lookup
 
-## Recommended next sprint
+```
+$ curl -s -o /tmp/cchat-c4.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
+    "http://127.0.0.1:17891/api/sessions/lookup?id=0ba636dc-5c0c-47c4-b4a7-27ea45e79533"
+HTTP=200 bytes=518 time=0.003319s
+matches: 1
+  session_id=0ba636dc-5c0c-47c4-b4a7-27ea45e79533
+  title="Continue Resolve Abandoned Work"  workspace=oslo
+```
 
-1. **`feat: FTS5 search index`** — separate PR. Add a `db.fts.py` module that builds and maintains an FTS5 table from `session_messages`. Replace `_candidates_for_term` to query FTS5 instead of LIKE. Update `db.py` to auto-rebuild the index on startup if it's missing or out-of-date (cheap: `INSERT INTO fts SELECT … WHERE rowid > <last_indexed_rowid>`). The Python-side `_confirm_term_in_text_blocks` stays — FTS5 just narrows candidates faster.
+**PASS** — 200 in 3ms, equality lookup returns the same single chat.
 
-## Acceptance criteria — final status
+## Check 5 — API: no-match returns 0 results
 
-| ID | Criterion | Status |
-|---|---|---|
-| A1 | run.sh opens browser within 3s | ✅ (live: 1.5s to URL printed) |
-| A2 | list endpoint, ordered by updated_at | ✅ |
-| A3 | search filters by text-block match | ✅ |
-| A4 | AND across terms | ✅ |
-| A5 | export to ~/Downloads, format matches CLI | ✅ |
-| A6 | Ctrl-C stops server cleanly | ✅ (verified by manual kill + ps check) |
-| A7 | search <2s on 329k rows | ❌ — common term 60s, rare term 7s |
-| A8 | read-only DB | ✅ (unit test + live re-verified) |
-| A9 | no pip deps in runtime | ✅ |
-| A10 | no native build | ✅ |
+```
+$ curl -s -o /tmp/cchat-c5.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
+    "http://127.0.0.1:17891/api/sessions/lookup?id=deadbeef"
+HTTP=200 bytes=2 time=0.005463s
+$ cat /tmp/cchat-c5.json
+[]
+```
 
-9/10 criteria pass. A7 misses by ~30×.
+**PASS** — 200 in 5ms, empty list (no chat starts with `deadbeef`).
 
-## Verdict
+## Check 6 — API: exact-phrase search finds the target chat
 
-**Implementation-complete and functional, with one known performance regression (A7).** The tool is *usable* — every other journey works correctly and the exported markdown is high-fidelity. A7 is a real gap and the FTS5 follow-up is the right fix.
+```
+$ curl -s --max-time 60 -o /tmp/cchat-c6.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
+    "http://127.0.0.1:17891/api/sessions?q_exact=PR%20%231720%20rebased%20cleanly"
+HTTP=200 bytes=847 time=0.835395s
+matches: 1
+  session_id=0ba636dc-5c0c-47c4-b4a7-27ea45e79533
+  title="Continue Resolve Abandoned Work"  workspace=oslo  match_kind=exact  is_hidden=1
+  snippet="«PR #1720 rebased cleanly» onto `38e5252ad9`, pushed as `0d94b42ca2`, `@mergifyio queue` sent. Should pick…"
+```
 
-**This is NOT "done"** in the operator's definition-of-done sense: A7 is a measurable failure. The honest framing is:
-> Implementation complete; live-validated as functionally correct on all journeys; one acceptance criterion (A7 perf) measurably fails and requires a follow-up FTS5 sprint.
+**PASS** — 200 in 835ms, exactly 1 match, the oslo `Continue Resolve
+Abandoned Work` chat. `match_kind: "exact"` confirms the snippet wraps
+the WHOLE phrase (`«PR #1720 rebased cleanly»`) — not the individual
+words. Search now surfaces hidden chats (fixed in PR #9).
 
-The operator can decide whether to:
-- (a) merge as-is and use the tool with the slow search, since it's still better than the broken Conductor UI workflow,
-- (b) hold the merge and do the FTS5 follow-up first,
-- (c) merge + immediately open the FTS5 issue.
+## Summary
+
+| # | Check | Status | Latency | Notes |
+|---|---|---|---|---|
+| 1 | `GET /` serves new ID input field | PASS | 4ms | 27258 bytes |
+| 2 | Toggle + persistence appears in HTML | PASS | (same fetch) | localStorage key emitted, both placeholders present |
+| 3 | `GET /api/sessions/lookup?id=0ba636dc` | PASS | 15ms | 1 match: oslo "Continue Resolve Abandoned Work" |
+| 4 | `GET /api/sessions/lookup?id=<full UUID>` | PASS | 3ms | Same chat |
+| 5 | `GET /api/sessions/lookup?id=deadbeef` | PASS | 5ms | Empty list (`[]`) |
+| 6 | `GET /api/sessions?q_exact=PR%20%231720%20rebased%20cleanly` | PASS | 835ms | 1 match, `match_kind=exact`, snippet wraps full phrase |
+
+**All 6 live checks PASS.**
+
+## Findings during validation (resolved before final report)
+
+The user's target chat had `is_hidden=1` in Conductor's DB. Two follow-up
+PRs (#8 lookup, #9 search) widened the visibility to include hidden chats
+whenever the user is actively querying (paste an ID, type a phrase). The
+default empty-state listing still hides them. Each result row now carries
+the `is_hidden` flag and the UI renders a `(hidden)` badge so the user
+knows the state.
 
 ## Cleanup
 
-- Test export artifact at `/Users/syedhaider/Downloads/conductor-chat-0ba636dc-...md` was deleted after journey 13.
-- `/tmp/cchat-stdout.log` removed.
+- `/tmp/cchat-c3.json`, `c4.json`, `c5.json`, `c6.json`, `/tmp/cchat-index.html` — transient curl artifacts, safe to leave or delete.
 - No persistent state changes to `conductor.db` (read-only).
+- Server left running on PID `$(cat /tmp/cchat-server.pid)` per the run protocol.
