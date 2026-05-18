@@ -417,6 +417,219 @@ def test_sessions_lookup_prefix_returns_rows(running_server):
     assert isinstance(body, list)
 
 
+# -- Feature: general file search (files-by-name, files-by-content, copy, reveal) --
+
+
+@pytest.fixture()
+def files_tree(tmp_path):
+    """Tree of fixture files for the file-search endpoints.
+
+    Lives under ``tmp_path`` so it's outside HOME — we use it as a
+    ``scope`` argument and validate_path_for_action allows /var/folders/.
+    """
+    root = tmp_path / "files_tree"
+    root.mkdir()
+    (root / "alpha.md").write_text(
+        "the quick brown fox migration of the 684 sites\n", encoding="utf-8"
+    )
+    (root / "beta.txt").write_text("hello world\n", encoding="utf-8")
+    (root / ".secret.md").write_text("hidden content here\n", encoding="utf-8")
+    return root
+
+
+def test_files_by_name_finds_match(running_server, files_tree):
+    from urllib.parse import urlencode
+    url = (
+        running_server["base"]
+        + "/api/files/by-name?"
+        + urlencode({"q": "alpha", "scope": str(files_tree)})
+    )
+    status, body = _get_json(url)
+    assert status == 200
+    basenames = [r["basename"] for r in body]
+    assert "alpha.md" in basenames
+    # Required fields:
+    row = next(r for r in body if r["basename"] == "alpha.md")
+    for k in ("path", "basename", "parent_dir", "size_bytes", "mtime_iso", "kind"):
+        assert k in row
+
+
+def test_files_by_name_missing_q_400(running_server):
+    status, body = _get_json_allow_err(running_server["base"] + "/api/files/by-name")
+    assert status == 400
+    assert "error" in body
+
+
+def test_files_by_name_include_hidden_toggle(running_server, files_tree):
+    from urllib.parse import urlencode
+    # Default include_hidden=True → finds .secret.md
+    url = (
+        running_server["base"]
+        + "/api/files/by-name?"
+        + urlencode({"q": "*.md", "scope": str(files_tree)})
+    )
+    status, body = _get_json(url)
+    assert status == 200
+    names = [r["basename"] for r in body]
+    assert ".secret.md" in names
+
+    # include_hidden=false → omits it
+    url2 = (
+        running_server["base"]
+        + "/api/files/by-name?"
+        + urlencode({"q": "*.md", "scope": str(files_tree), "include_hidden": "false"})
+    )
+    status2, body2 = _get_json(url2)
+    assert status2 == 200
+    names2 = [r["basename"] for r in body2]
+    assert ".secret.md" not in names2
+    assert "alpha.md" in names2
+
+
+def test_files_by_content_finds_phrase(running_server, files_tree):
+    from urllib.parse import urlencode
+    from conductor_chat import files as F
+    if not F.ripgrep_available():
+        pytest.skip("ripgrep not installed")
+    url = (
+        running_server["base"]
+        + "/api/files/by-content?"
+        + urlencode({"q": "migration of the 684 sites", "scope": str(files_tree)})
+    )
+    status, body = _get_json(url)
+    assert status == 200
+    assert any(r["path"].endswith("/alpha.md") for r in body)
+    # Snippet carries the «match» markers.
+    matched = [r for r in body if r["path"].endswith("/alpha.md")]
+    assert "«migration of the 684 sites»" in matched[0]["match_text"]
+
+
+def test_files_by_content_missing_q_400(running_server):
+    from conductor_chat import files as F
+    if not F.ripgrep_available():
+        pytest.skip("ripgrep not installed")
+    status, body = _get_json_allow_err(
+        running_server["base"] + "/api/files/by-content"
+    )
+    assert status == 400
+
+
+def test_files_by_content_503_when_rg_unavailable(running_server_no_rg, files_tree):
+    """The endpoint returns 503 with an install hint when ripgrep is missing."""
+    from urllib.parse import urlencode
+    url = (
+        running_server_no_rg["base"]
+        + "/api/files/by-content?"
+        + urlencode({"q": "anything", "scope": str(files_tree)})
+    )
+    status, body = _get_json_allow_err(url)
+    assert status == 503
+    assert "ripgrep" in body["error"].lower()
+    assert "brew install ripgrep" in body["error"]
+
+
+def test_files_copy_to_downloads(running_server, files_tree, tmp_path, monkeypatch):
+    """POSTing a path copies it to the (mocked) Downloads dir and verifies."""
+    import os as _os
+    # Redirect ~/Downloads to a temp dir so we don't pollute the real one.
+    fake_dl = tmp_path / "FakeDownloads"
+    fake_dl.mkdir()
+    from conductor_chat import files as F
+    monkeypatch.setattr(F, "DEFAULT_DOWNLOADS_DIR", str(fake_dl))
+
+    src = files_tree / "alpha.md"
+    status, body = _post_json(
+        running_server["base"] + "/api/files/copy-to-downloads",
+        {"path": str(src)},
+    )
+    assert status == 200, body
+    assert body["verified"] is True
+    assert body["bytes"] == src.stat().st_size
+    assert _os.path.exists(body["copied_to"])
+    assert body["copied_to"].startswith(str(fake_dl))
+
+
+def test_files_copy_rejects_missing_path(running_server):
+    status, body = _post_json(
+        running_server["base"] + "/api/files/copy-to-downloads",
+        {"path": "/no/such/file/exists.xyz"},
+    )
+    assert status == 404
+    assert "error" in body
+
+
+def test_files_copy_rejects_missing_body_field(running_server):
+    status, body = _post_json(
+        running_server["base"] + "/api/files/copy-to-downloads",
+        {},
+    )
+    assert status == 400
+
+
+def test_files_copy_rejects_outside_home(running_server):
+    """/etc/hosts is outside HOME and Volumes; should be 400."""
+    status, body = _post_json(
+        running_server["base"] + "/api/files/copy-to-downloads",
+        {"path": "/etc/hosts"},
+    )
+    assert status == 400
+    assert "outside" in body["error"].lower()
+
+
+def test_files_reveal_invokes_open_dash_r(running_server, files_tree, monkeypatch):
+    """POSTing reveal calls open -R via subprocess (mocked)."""
+    import subprocess as _sp
+    from conductor_chat import files as F
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        return _sp.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(F.subprocess, "run", fake_run)
+
+    src = files_tree / "alpha.md"
+    status, body = _post_json(
+        running_server["base"] + "/api/files/reveal",
+        {"path": str(src)},
+    )
+    assert status == 200
+    assert body == {"ok": True}
+    assert captured["argv"][:2] == ["open", "-R"]
+    assert captured["argv"][2] == str(src)
+
+
+def test_files_reveal_rejects_missing(running_server):
+    status, body = _post_json(
+        running_server["base"] + "/api/files/reveal",
+        {"path": "/no/such/file/exists.xyz"},
+    )
+    assert status == 404
+    assert body["ok"] is False
+
+
+@pytest.fixture()
+def running_server_no_rg():
+    """Like ``running_server`` but with ripgrep marked unavailable."""
+    db_path = build_search_fixture()
+    httpd = server.make_server(
+        host="127.0.0.1", port=0, db_path=db_path, fts_path=None, ripgrep_ok=False
+    )
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {"base": f"http://127.0.0.1:{port}"}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
 def test_sessions_lookup_row_shape(running_server):
     """Returned rows match the /api/sessions row shape (so the same UI renderer works)."""
     # Build a fresh fixture with a long session id we can prefix-match.

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import accounts, db, export, fts, search
+from . import accounts, db, export, files, fts, search
 
 STATIC_DIR = Path(__file__).parent / "static"
 ALLOWED_STATIC: set[str] = {"index.html"}
@@ -41,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path: str = db.DEFAULT_DB_PATH
     fts_path: str | None = fts.DEFAULT_FTS_PATH  # None = disable FTS (LIKE fallback)
     account_index: dict[str, str] = {}  # {session_id: account_name}; empty = unindexed
+    ripgrep_ok: bool = True  # set False at startup when `rg` couldn't be found/installed
 
     # ---- routing ----
 
@@ -89,12 +90,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             self._handle_sessions(parse_qs(parsed.query, keep_blank_values=False))
             return
+        if path == "/api/files/by-name":
+            self._handle_files_by_name(parse_qs(parsed.query, keep_blank_values=False))
+            return
+        if path == "/api/files/by-content":
+            self._handle_files_by_content(parse_qs(parsed.query, keep_blank_values=False))
+            return
         self._send_json(404, {"error": "not_found"})
 
     def _route_post(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/export":
             self._handle_export()
+            return
+        if parsed.path == "/api/files/copy-to-downloads":
+            self._handle_files_copy()
+            return
+        if parsed.path == "/api/files/reveal":
+            self._handle_files_reveal()
             return
         self._send_json(404, {"error": "not_found"})
 
@@ -247,6 +260,103 @@ class Handler(BaseHTTPRequestHandler):
         result["verified_at"] = verified["at"]
         self._send_json(200, result)
 
+    # ---- files-tab handlers (name search, content search, copy, reveal) ----
+
+    def _handle_files_by_name(self, qs: dict[str, list[str]]) -> None:
+        q = (qs.get("q", [""])[0] or "").strip()
+        if not q:
+            self._send_json(400, {"error": "q query param required"})
+            return
+        scope = (qs.get("scope", ["/"])[0] or "/").strip() or "/"
+        include_hidden = _qs_bool(qs, "include_hidden", default=True)
+        try:
+            rows = files.find_by_name(q, scope=scope, include_hidden=include_hidden)
+        except OSError as e:
+            self._send_json(500, {"error": f"find failed: {e}"})
+            return
+        self._send_json(200, rows)
+
+    def _handle_files_by_content(self, qs: dict[str, list[str]]) -> None:
+        if not self.ripgrep_ok:
+            self._send_json(
+                503,
+                {"error": "ripgrep not installed. Run: brew install ripgrep"},
+            )
+            return
+        q = (qs.get("q", [""])[0] or "").strip()
+        if not q:
+            self._send_json(400, {"error": "q query param required"})
+            return
+        scope = (qs.get("scope", ["/"])[0] or "/").strip() or "/"
+        include_hidden = _qs_bool(qs, "include_hidden", default=True)
+        try:
+            rows = files.find_by_content(q, scope=scope, include_hidden=include_hidden)
+        except OSError as e:
+            self._send_json(500, {"error": f"rg failed: {e}"})
+            return
+        self._send_json(200, rows)
+
+    def _handle_files_copy(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return  # _read_json_body already sent the error response
+        path = body.get("path")
+        if not isinstance(path, str) or not path:
+            self._send_json(400, {"error": "path required"})
+            return
+        ok, err = files.validate_path_for_action(path)
+        if not ok:
+            # 404 for missing, 400 for outside-home — pick by message.
+            status = 404 if err and "not found" in err else 400
+            self._send_json(status, {"error": err})
+            return
+        try:
+            result = files.copy_to_downloads(path)
+        except FileNotFoundError as e:
+            self._send_json(404, {"error": str(e)})
+            return
+        except (IsADirectoryError, ValueError) as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        except OSError as e:
+            self._send_json(500, {"error": f"copy failed: {e}"})
+            return
+        if not result.get("verified"):
+            self._send_json(500, {"error": "copy verify failed", **result})
+            return
+        self._send_json(200, result)
+
+    def _handle_files_reveal(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+        path = body.get("path")
+        if not isinstance(path, str) or not path:
+            self._send_json(400, {"error": "path required"})
+            return
+        ok, err = files.validate_path_for_action(path)
+        if not ok:
+            status = 404 if err and "not found" in err else 400
+            self._send_json(status, {"ok": False, "error": err})
+            return
+        result = files.reveal_in_finder(path)
+        # reveal_in_finder always returns a dict; surface its ok flag.
+        self._send_json(200 if result.get("ok") else 500, result)
+
+    def _read_json_body(self) -> dict[str, Any] | None:
+        """Read+parse the request JSON body. Sends 400 and returns None on error."""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": f"invalid JSON body: {e}"})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "JSON body must be an object"})
+            return None
+        return body
+
     # ---- response helpers ----
 
     def _send_json(self, status: int, body: Any) -> None:
@@ -284,6 +394,28 @@ class Handler(BaseHTTPRequestHandler):
         # just log method+path+duration.
         sys.stderr.write(f"{method} {self.path} {dur_ms}ms\n")
         sys.stderr.flush()
+
+
+# -- query-string helpers --
+
+
+def _qs_bool(qs: dict[str, list[str]], key: str, default: bool = False) -> bool:
+    """Parse a boolean query-string param.
+
+    Accepts ``1``/``0``, ``true``/``false``, ``yes``/``no`` (case-insensitive).
+    Missing or empty value falls back to ``default``.
+    """
+    raw_list = qs.get(key, [])
+    if not raw_list:
+        return default
+    raw = (raw_list[0] or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 # -- path safety --
@@ -403,6 +535,7 @@ def make_server(
     db_path: str | None = None,
     fts_path: str | None | object = ...,
     account_index: dict[str, str] | None = None,
+    ripgrep_ok: bool | None = None,
 ) -> ThreadingHTTPServer:
     """Construct (don't start) a ThreadingHTTPServer with the routes wired.
 
@@ -429,6 +562,13 @@ def make_server(
     BoundHandler.db_path = resolved_db
     BoundHandler.fts_path = resolved_fts
     BoundHandler.account_index = account_index or {}
+    # If caller didn't explicitly state ripgrep status, probe at construction
+    # time. ``False`` here disables the /api/files/by-content endpoint with
+    # a 503 explaining how to install rg.
+    if ripgrep_ok is None:
+        BoundHandler.ripgrep_ok = files.ripgrep_available()
+    else:
+        BoundHandler.ripgrep_ok = ripgrep_ok
     httpd = ThreadingHTTPServer((host, port), BoundHandler)
     return httpd
 
@@ -508,6 +648,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             resolved_fts = None
 
+    # Probe ripgrep. If it's missing, try one best-effort `brew install` so the
+    # operator doesn't have to. Failures are non-fatal — the file-content tab
+    # just returns 503 with the install command in the error body.
+    ripgrep_ok = files.ripgrep_available()
+    if not ripgrep_ok:
+        sys.stderr.write(
+            "WARN: ripgrep (`rg`) not found. Attempting `brew install ripgrep`…\n"
+        )
+        installed, msg = files.try_install_ripgrep_via_brew()
+        if installed:
+            sys.stderr.write("ripgrep installed via brew.\n")
+            ripgrep_ok = True
+        else:
+            sys.stderr.write(
+                f"WARN: could not install ripgrep ({msg}). "
+                f"Content search will be unavailable. "
+                f"Install manually: brew install ripgrep\n"
+            )
+
     # Build the account index once at startup. Refresh requires restart.
     try:
         account_index = accounts.build_index()
@@ -526,6 +685,7 @@ def main(argv: list[str] | None = None) -> int:
             db_path=args.db,
             fts_path=resolved_fts,
             account_index=account_index,
+            ripgrep_ok=ripgrep_ok,
         )
     except OSError as e:
         sys.stderr.write(f"ERROR binding {args.host}:{args.port}: {e}\n")
