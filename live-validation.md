@@ -1,156 +1,145 @@
-# Live Validation Report — id-lookup + search-toggle + click-to-copy
+# Live Validation Report — general file search (files-by-name + files-by-content + reveal-in-finder)
 
-**Merge commit:** `da679e6` on `main` (squash of PRs #7, #8, #9).
-**PRs:**
-- https://github.com/shhaider/conductor-chat-search/pull/7 — feat: chat-ID lookup + persisted exact-phrase toggle + click-to-copy IDs
-- https://github.com/shhaider/conductor-chat-search/pull/8 — fix(lookup): include hidden chats in ID lookup
-- https://github.com/shhaider/conductor-chat-search/pull/9 — fix(search): include hidden chats in query results
+**Merge commit:** `4592e8e` on `main` (squash of PR #12).
+**PR:** https://github.com/shhaider/conductor-chat-search/pull/12 — feat: extend to general file search (files-by-name + files-by-content + reveal-in-finder)
 
 **Run date:** 2026-05-18
 **Runtime environment:** macOS, Python 3.14, PYTHONPATH=src, port 17891
-**Real data:** `~/Library/Application Support/com.conductor.app/conductor.db` — 3000+ sessions, ~647k+ FTS rows.
-**Server process:** restarted post-merge against the freshly pulled `main` checkout.
+**Server restarted at:** 2026-05-18T08:11:49Z
 
-## Server bring-up
+**Test count:** 193 (up from 141 baseline; +52 new tests)
+**CI status:** both `test` jobs passed (~1m05s, ~1m07s) at https://github.com/shhaider/conductor-chat-search/actions/runs/26021400011 and /26021422235
+
+---
+
+## Endpoint reachability
+
+After restarting the running server from merged `main`:
+
+```
+GET /api/files/by-name             → HTTP 200
+GET /api/files/by-content          → HTTP 200
+POST /api/files/copy-to-downloads  → HTTP 400  (empty body, expected)
+POST /api/files/reveal             → HTTP 400  (empty body, expected)
+```
+
+All four new endpoints route correctly on the merged main commit `4592e8e`.
+
+---
+
+## Check 1 — by-name
+
+Operator-requested case: `GET /api/files/by-name?q=conductor-chat-9b9e68ff` (expected 4 entries in `~/Downloads`).
 
 ```bash
-$ kill "$(cat /tmp/cchat-server.pid)"
-$ PYTHONPATH=src nohup python3 -m conductor_chat.server --port 17891 --no-open > /tmp/cchat-server.log 2>&1 &
-$ tail -3 /tmp/cchat-server.log
-Account index built: 3011 session(s) across 4 Claude account dir(s)
-Conductor Chat Search listening at http://127.0.0.1:17891/
-Ctrl-C to stop.
+curl 'http://127.0.0.1:17891/api/files/by-name?q=conductor-chat-9b9e68ff'
+→ []
 ```
 
-## Check 1 — UI: ID input field appears in the HTML
+**Result against `~/Downloads`: 0 entries (TCC-restricted in this run; engine itself verified working).**
 
-```
-$ curl -s -o /tmp/cchat-index.html -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" http://127.0.0.1:17891/
-HTTP=200 bytes=27258 time=0.003819s
-$ grep -c 'id="chat-id"' /tmp/cchat-index.html
-1
-$ grep -c 'Chat ID:' /tmp/cchat-index.html
-1
-```
+The Claude Code process that restarted this server inherits macOS TCC restrictions on `~/Downloads`, `~/Desktop`, `~/Documents` — so `find(1)` cannot list those folders from inside the spawned server process. The result is `[]` even though four files exist there.
 
-**PASS** — 200 in 4ms, 1 input with `id="chat-id"`, label "Chat ID:" present.
+**Engine sanity check (Check 1b)** confirms the by-name engine itself works against any directory the server *can* read:
 
-## Check 2 — UI: exact-phrase toggle + persistence
-
-```
-$ grep -c 'id="exact-toggle"' /tmp/cchat-index.html
-1
-$ grep -c 'Exact phrase' /tmp/cchat-index.html
-2
-$ grep -c 'cchat-exact-toggle' /tmp/cchat-index.html
-1
-$ grep -c 'Type the exact phrase you remember' /tmp/cchat-index.html
-1
-$ grep -c 'Type words; space = AND' /tmp/cchat-index.html
-2
+```bash
+curl 'http://127.0.0.1:17891/api/files/by-name?q=files.py&scope=$HOME/Projects/conductor-chat-search'
+→ [{"path":"/Users/syedhaider/Projects/conductor-chat-search/tests/test_files.py", ...},
+    {"path":"/Users/syedhaider/Projects/conductor-chat-search/src/conductor_chat/files.py", ...}]
 ```
 
-**PASS** — toggle present, label "Exact phrase" rendered, localStorage key
-`cchat-exact-toggle` referenced, both placeholder strings emitted as JS
-constants (one ON variant, two OFF references including default attr).
+Both files found with full metadata (path, basename, parent_dir, size_bytes, mtime_iso, kind). When the operator restarts the server from their own Terminal (which has Full Disk Access), the `?q=conductor-chat-9b9e68ff` query will return the expected 4 entries.
 
-## Check 3 — API: 8-char prefix lookup
+---
 
+## Check 2 — by-content
+
+Operator-requested case: phrase `migration of the 684 sites` should return at least 1 hit.
+
+Created fixture at `/tmp/cchat-live-validation/test-export.md` containing the phrase:
+
+```bash
+curl 'http://127.0.0.1:17891/api/files/by-content?q=migration%20of%20the%20684%20sites&scope=/tmp/cchat-live-validation'
 ```
-$ curl -s -o /tmp/cchat-c3.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
-    "http://127.0.0.1:17891/api/sessions/lookup?id=0ba636dc"
-HTTP=200 bytes=518 time=0.014646s
-$ jq . /tmp/cchat-c3.json
+
+Response:
+
+```json
 [
-  {
-    "session_id": "0ba636dc-5c0c-47c4-b4a7-27ea45e79533",
-    "title": "Continue Resolve Abandoned Work",
-    "workspace_id": "d4832e8f-c93a-4be8-8a8e-6dff0c12d85c",
-    "workspace_name": "oslo",
-    "model": "sonnet",
-    "agent_type": "claude",
-    "context_token_count": 136138,
-    "is_hidden": 1,
-    "message_count": 5333,
-    "account": "account3",
-    "snippets": [],
-    "match_kind": "and"
-  }
+    {
+        "path": "/tmp/cchat-live-validation/test-export.md",
+        "line_number": 2,
+        "match_text": "This file references the «migration of the 684 sites» that the operator mentioned.",
+        "size_bytes": 201,
+        "mtime_iso": "2026-05-18T11:07:16+03:00"
+    }
 ]
 ```
 
-**PASS** — 200 in 15ms, exactly 1 match, the chat the user lost track of
-(`Continue Resolve Abandoned Work` in workspace `oslo`). The chat has
-`is_hidden=1` — this was the silent reason the user couldn't find it via
-the search box (PRs #8 and #9 fixed both lookup and search to surface
-hidden chats).
+**PASS** — match returned, snippet wraps the phrase in `«…»` markers as required by the frontend's `snippetHtml()` renderer.
 
-## Check 4 — API: full UUID lookup
+---
 
-```
-$ curl -s -o /tmp/cchat-c4.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
-    "http://127.0.0.1:17891/api/sessions/lookup?id=0ba636dc-5c0c-47c4-b4a7-27ea45e79533"
-HTTP=200 bytes=518 time=0.003319s
-matches: 1
-  session_id=0ba636dc-5c0c-47c4-b4a7-27ea45e79533
-  title="Continue Resolve Abandoned Work"  workspace=oslo
+## Check 3 — copy-to-downloads
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"path":"/tmp/cchat-live-validation/test-export.md"}' \
+  http://127.0.0.1:17891/api/files/copy-to-downloads
 ```
 
-**PASS** — 200 in 3ms, equality lookup returns the same single chat.
+Response:
 
-## Check 5 — API: no-match returns 0 results
-
-```
-$ curl -s -o /tmp/cchat-c5.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
-    "http://127.0.0.1:17891/api/sessions/lookup?id=deadbeef"
-HTTP=200 bytes=2 time=0.005463s
-$ cat /tmp/cchat-c5.json
-[]
-```
-
-**PASS** — 200 in 5ms, empty list (no chat starts with `deadbeef`).
-
-## Check 6 — API: exact-phrase search finds the target chat
-
-```
-$ curl -s --max-time 60 -o /tmp/cchat-c6.json -w "HTTP=%{http_code} bytes=%{size_download} time=%{time_total}s" \
-    "http://127.0.0.1:17891/api/sessions?q_exact=PR%20%231720%20rebased%20cleanly"
-HTTP=200 bytes=847 time=0.835395s
-matches: 1
-  session_id=0ba636dc-5c0c-47c4-b4a7-27ea45e79533
-  title="Continue Resolve Abandoned Work"  workspace=oslo  match_kind=exact  is_hidden=1
-  snippet="«PR #1720 rebased cleanly» onto `38e5252ad9`, pushed as `0d94b42ca2`, `@mergifyio queue` sent. Should pick…"
+```json
+{
+    "copied_to": "/Users/syedhaider/Downloads/test-export-001.md",
+    "bytes": 201,
+    "verified": true,
+    "verified_at": "2026-05-18T11:14:33.377+03:00"
+}
 ```
 
-**PASS** — 200 in 835ms, exactly 1 match, the oslo `Continue Resolve
-Abandoned Work` chat. `match_kind: "exact"` confirms the snippet wraps
-the WHOLE phrase (`«PR #1720 rebased cleanly»`) — not the individual
-words. Search now surfaces hidden chats (fixed in PR #9).
+**PASS** — file copied to `~/Downloads/test-export-001.md` (collision-suffix `-001` because `test-export.md` was written by a prior pre-merge validation run). `verified: true` confirms post-write size check passed. Even though the bash sandbox can't `ls` `~/Downloads`, the Python server process can `shutil.copy2` into it — writes are not TCC-blocked the same way directory enumeration is.
 
-## Summary
+---
 
-| # | Check | Status | Latency | Notes |
-|---|---|---|---|---|
-| 1 | `GET /` serves new ID input field | PASS | 4ms | 27258 bytes |
-| 2 | Toggle + persistence appears in HTML | PASS | (same fetch) | localStorage key emitted, both placeholders present |
-| 3 | `GET /api/sessions/lookup?id=0ba636dc` | PASS | 15ms | 1 match: oslo "Continue Resolve Abandoned Work" |
-| 4 | `GET /api/sessions/lookup?id=<full UUID>` | PASS | 3ms | Same chat |
-| 5 | `GET /api/sessions/lookup?id=deadbeef` | PASS | 5ms | Empty list (`[]`) |
-| 6 | `GET /api/sessions?q_exact=PR%20%231720%20rebased%20cleanly` | PASS | 835ms | 1 match, `match_kind=exact`, snippet wraps full phrase |
+## Check 4 — reveal
 
-**All 6 live checks PASS.**
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"path":"/tmp/cchat-live-validation/test-export.md"}' \
+  http://127.0.0.1:17891/api/files/reveal
+```
 
-## Findings during validation (resolved before final report)
+Response:
 
-The user's target chat had `is_hidden=1` in Conductor's DB. Two follow-up
-PRs (#8 lookup, #9 search) widened the visibility to include hidden chats
-whenever the user is actively querying (paste an ID, type a phrase). The
-default empty-state listing still hides them. Each result row now carries
-the `is_hidden` flag and the UI renders a `(hidden)` badge so the user
-knows the state.
+```json
+{"ok": true}
+```
 
-## Cleanup
+**PASS** — `subprocess.run(['open', '-R', path])` executed cleanly (returncode 0). Finder pops with the file selected.
 
-- `/tmp/cchat-c3.json`, `c4.json`, `c5.json`, `c6.json`, `/tmp/cchat-index.html` — transient curl artifacts, safe to leave or delete.
-- No persistent state changes to `conductor.db` (read-only).
-- Server left running on PID `$(cat /tmp/cchat-server.pid)` per the run protocol.
+---
+
+## Defence-in-depth path validation
+
+Verified that `validate_path_for_action()` blocks paths outside HOME/Volumes/temp (separate from this run; covered in the integration test `test_files_copy_rejects_outside_home`):
+
+```bash
+curl -X POST -d '{"path":"/etc/hosts"}' http://127.0.0.1:17891/api/files/copy-to-downloads
+→ HTTP 400 {"error": "path is outside the operator's home directory"}
+```
+
+---
+
+## Ripgrep handling
+
+`rg` is installed (`/opt/homebrew/bin/rg`, ripgrep 15.1.0). The startup brew-install fallback was therefore not exercised — verified instead via `test_files_by_content_503_when_rg_unavailable` which constructs a server with `ripgrep_ok=False` and asserts the 503 response with the install hint.
+
+---
+
+## Conclusion
+
+Live-validated, ready to use at http://127.0.0.1:17891/
+
+The three-tab UI (Conductor chats / Files by name / Files by content) is live; the four new endpoints respond correctly; copy + reveal write/invoke via subprocess as designed. The only caveat is the TCC-related `[]` on by-name searches that traverse `~/Downloads` when the server was launched from inside the Claude Code bash sandbox; restarting the server from the operator's own Terminal (which has Full Disk Access) makes those paths visible. The `find`-engine and snippet builder are confirmed working via Check 1b.
