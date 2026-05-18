@@ -27,8 +27,28 @@
   button { background: var(--row); color: var(--fg); border: 1px solid var(--border); padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 13px; }
   button:hover { background: var(--row-hover); }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
-  .controls { display: flex; gap: 10px; padding: 14px 20px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 49px; z-index: 4; }
-  .controls input[type="search"] { flex: 1 1 360px; min-width: 240px; padding: 8px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; transition: border-color 0.2s; }
+
+  /* Tab strip — sits between header and the per-tab controls. */
+  .tabs { display: flex; gap: 0; padding: 0 20px; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 49px; z-index: 4; }
+  .tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    color: var(--muted);
+    padding: 10px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .tab:hover { color: var(--fg); background: var(--row); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  .controls { display: flex; gap: 10px; padding: 14px 20px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--bg); }
+  .controls input[type="search"], .controls input[type="text"] { flex: 1 1 360px; min-width: 240px; padding: 8px 11px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; transition: border-color 0.2s; }
   /* The chat-ID lookup row sits above the search controls. */
   .id-lookup { display: flex; gap: 10px; padding: 12px 20px 0 20px; align-items: center; flex-wrap: wrap; background: var(--bg); }
   .id-lookup label { color: var(--muted); font-size: 12px; }
@@ -39,7 +59,7 @@
   .sid.copyable:hover { background: var(--code-bg); color: var(--accent); }
   .sid.copied { color: var(--ok) !important; }
   /* While a search is in flight: dim and pulse the border on the input. Stays editable. */
-  .controls input[type="search"].searching {
+  .controls input[type="search"].searching, .controls input[type="text"].searching {
     border-color: var(--accent);
     animation: search-pulse 1.2s ease-in-out infinite;
   }
@@ -49,7 +69,10 @@
   }
   .controls select { padding: 7px 9px; background: var(--row); border: 1px solid var(--border); color: var(--fg); border-radius: 4px; font-size: 13px; }
   .controls select:disabled { opacity: 0.5; cursor: not-allowed; }
-  #results { padding: 12px 20px; }
+  .controls label.cb { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; user-select: none; cursor: pointer; padding: 0 4px; }
+  .controls label.cb input { margin: 0; cursor: pointer; }
+  .controls .scope-input { flex: 0 1 200px; min-width: 120px; }
+  #results, #file-name-results, #file-content-results { padding: 12px 20px; }
   .row { background: var(--row); border: 1px solid var(--border); padding: 11px 14px; margin-bottom: 9px; border-radius: 5px; border-left: 3px solid transparent; }
   .row:hover { background: var(--row-hover); }
   .row.exact { border-left-color: var(--accent); background: linear-gradient(90deg, rgba(122,162,247,0.08) 0%, rgba(122,162,247,0) 70%), var(--row); }
@@ -74,7 +97,16 @@
   .snippet { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; background: var(--code-bg); padding: 4px 7px; border-radius: 3px; margin: 4px 0; line-height: 1.4; color: #cdd6f4; }
   .snippet .term-label { color: var(--accent); margin-right: 6px; }
   mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0 2px; border-radius: 2px; }
-  .row-actions { margin-top: 9px; }
+  .row-actions { margin-top: 9px; display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* File-row specifics. */
+  .file-path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--muted); word-break: break-all; }
+  .file-basename { font-weight: 600; color: var(--fg); }
+  .file-kind { font-size: 11px; padding: 1px 6px; border-radius: 3px; color: var(--muted); background: #25272d; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .file-kind.dir  { color: var(--accent); background: #1a2a3a; }
+  .file-kind.symlink { color: #f7c878; background: #3a2a1a; }
+  .file-size { color: var(--muted); font-size: 12px; }
+  .file-line { color: var(--muted); font-size: 12px; }
 
   /* Export button — verified-flow states.
      Sequence: Export → "Exporting…" (with spinner) → "Verifying…" → "✓ Exported"
@@ -163,32 +195,74 @@
   <button class="dismiss" id="perf-banner-dismiss" title="Dismiss this notice">Dismiss</button>
 </div>
 
-<div class="id-lookup">
-  <label for="chat-id">Chat ID:</label>
-  <input id="chat-id" type="text" placeholder="paste a full UUID or any prefix ≥8 chars to jump directly to a chat" autocomplete="off" spellcheck="false">
-  <button id="chat-id-clear" title="Clear the ID input">Clear ID</button>
-  <span class="hint">Independent of the search box.</span>
-</div>
+<nav class="tabs">
+  <button class="tab active" data-tab="chats" id="tab-chats">Conductor chats</button>
+  <button class="tab" data-tab="filename" id="tab-filename">Files by name</button>
+  <button class="tab" data-tab="content" id="tab-content">Files by content</button>
+</nav>
 
-<div class="controls">
-  <label class="exact-toggle" title="When ON, the entire input is sent as one phrase (no word splitting).">
-    <input id="exact-toggle" type="checkbox">
-    Exact phrase
-  </label>
-  <input id="q" type="search" placeholder='Type words; space = AND' autocomplete="off" autofocus>
-  <button id="clear">Clear</button>
-  <select id="workspace">
-    <option value="">All workspaces</option>
-  </select>
-  <select id="account" title="Filter by which Claude account holds this session's resumable JSONL.">
-    <option value="">All accounts</option>
-    <option value="__orphaned__">(orphaned)</option>
-  </select>
-</div>
+<!-- ========== Tab: Conductor chats (default) ========== -->
+<section class="tab-panel active" data-panel="chats">
+  <div class="id-lookup">
+    <label for="chat-id">Chat ID:</label>
+    <input id="chat-id" type="text" placeholder="paste a full UUID or any prefix ≥8 chars to jump directly to a chat" autocomplete="off" spellcheck="false">
+    <button id="chat-id-clear" title="Clear the ID input">Clear ID</button>
+    <span class="hint">Independent of the search box.</span>
+  </div>
 
-<div class="search-status hidden" id="search-status"></div>
+  <div class="controls">
+    <label class="exact-toggle" title="When ON, the entire input is sent as one phrase (no word splitting).">
+      <input id="exact-toggle" type="checkbox">
+      Exact phrase
+    </label>
+    <input id="q" type="search" placeholder='Type words; space = AND' autocomplete="off" autofocus>
+    <button id="clear">Clear</button>
+    <select id="workspace">
+      <option value="">All workspaces</option>
+    </select>
+    <select id="account" title="Filter by which Claude account holds this session's resumable JSONL.">
+      <option value="">All accounts</option>
+      <option value="__orphaned__">(orphaned)</option>
+    </select>
+  </div>
 
-<div id="results"><div class="empty">loading…</div></div>
+  <div class="search-status hidden" id="search-status"></div>
+  <div id="results"><div class="empty">loading…</div></div>
+</section>
+
+<!-- ========== Tab: Files by name ========== -->
+<section class="tab-panel" data-panel="filename">
+  <div class="controls">
+    <input id="fn-q" type="search" placeholder="filename or glob (e.g. *.md, conductor-chat-*)" autocomplete="off">
+    <input id="fn-scope" type="text" class="scope-input" placeholder="/ (scope)" value="/" autocomplete="off">
+    <label class="cb" title="Include dot-prefixed names like .config or .hidden.md">
+      <input id="fn-hidden" type="checkbox" checked>
+      Include hidden
+    </label>
+    <button id="fn-clear">Clear</button>
+  </div>
+  <div class="search-status hidden" id="fn-status"></div>
+  <div id="file-name-results"><div class="empty">Type a filename pattern above.</div></div>
+</section>
+
+<!-- ========== Tab: Files by content ========== -->
+<section class="tab-panel" data-panel="content">
+  <div class="controls">
+    <label class="exact-toggle" title="Currently all content searches are treated as literal phrases (ripgrep --fixed-strings).">
+      <input id="fc-exact" type="checkbox">
+      Exact phrase
+    </label>
+    <input id="fc-q" type="search" placeholder="phrase to search inside files" autocomplete="off">
+    <input id="fc-scope" type="text" class="scope-input" placeholder="/ (scope)" value="/" autocomplete="off">
+    <label class="cb" title="Search inside hidden files and dot-prefixed directories">
+      <input id="fc-hidden" type="checkbox" checked>
+      Include hidden
+    </label>
+    <button id="fc-clear">Clear</button>
+  </div>
+  <div class="search-status hidden" id="fc-status"></div>
+  <div id="file-content-results"><div class="empty">Type a phrase above to search file contents (ripgrep).</div></div>
+</section>
 
 <div class="status" id="status">Ready.</div>
 
@@ -207,6 +281,19 @@ const elSearchStatus = $("#search-status");
 const elMeta = $("#meta");
 const elBanner = $("#banner");
 const elPerfBanner = $("#perf-banner");
+// Files-by-name
+const elFnQ = $("#fn-q");
+const elFnScope = $("#fn-scope");
+const elFnHidden = $("#fn-hidden");
+const elFnStatus = $("#fn-status");
+const elFnResults = $("#file-name-results");
+// Files-by-content
+const elFcQ = $("#fc-q");
+const elFcScope = $("#fc-scope");
+const elFcHidden = $("#fc-hidden");
+const elFcStatus = $("#fc-status");
+const elFcResults = $("#file-content-results");
+
 const ORPHANED_SENTINEL = "__orphaned__";
 // Accounts seen across all loaded rows. Used to populate the filter dropdown.
 let seenAccounts = new Set();
@@ -214,13 +301,18 @@ let seenAccounts = new Set();
 let lastFetchToken = 0;
 let debounceTimer = null;
 let idDebounceTimer = null;
+let fnDebounceTimer = null;
+let fcDebounceTimer = null;
 // AbortController for the in-flight /api/sessions request. We abort the old one
 // when the user kicks off a new search, so slow requests don't pile up.
 let inflightController = null;
 let inflightLookupController = null;
+let inflightFnController = null;
+let inflightFcController = null;
 
 const PERF_BANNER_KEY = "cchat-perf-banner-dismissed";
 const EXACT_TOGGLE_KEY = "cchat-exact-toggle";
+const ACTIVE_TAB_KEY = "cchat-active-tab";
 const PLACEHOLDER_EXACT = "Type the exact phrase you remember";
 const PLACEHOLDER_AND = "Type words; space = AND";
 
@@ -267,6 +359,14 @@ function relAge(iso) {
   return d.toISOString().slice(0, 10);
 }
 
+function fmtBytes(n) {
+  if (n == null || isNaN(n)) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  return (n / 1024 / 1024 / 1024).toFixed(1) + " GB";
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -304,22 +404,24 @@ function setStatus(text, cls) {
   elStatus.textContent = text;
 }
 
-// Update the above-results live status line. cls one of: "", "loading", "ok", "error".
-// Pass null/empty text to hide.
-function setSearchStatus(text, cls) {
+// Update a live status line. ``el`` is the target element. cls one of:
+// "", "loading", "ok", "error". Pass null/empty text to hide.
+function setStatusLine(el, text, cls) {
   if (!text) {
-    elSearchStatus.className = "search-status hidden";
-    elSearchStatus.textContent = "";
+    el.className = "search-status hidden";
+    el.textContent = "";
     return;
   }
-  elSearchStatus.className = "search-status" + (cls ? " " + cls : "");
-  // Build spinner + text. innerHTML is fine here: text passes through escapeHtml.
+  el.className = "search-status" + (cls ? " " + cls : "");
   if (cls === "loading") {
-    elSearchStatus.innerHTML = '<span class="spinner" aria-hidden="true"></span><span>' + escapeHtml(text) + '</span>';
+    el.innerHTML = '<span class="spinner" aria-hidden="true"></span><span>' + escapeHtml(text) + '</span>';
   } else {
-    elSearchStatus.textContent = text;
+    el.textContent = text;
   }
 }
+
+// Convenience wrapper kept for the existing chat-tab code paths.
+function setSearchStatus(text, cls) { setStatusLine(elSearchStatus, text, cls); }
 
 // Toggle the "search in progress" affordance: dim+pulse the input border,
 // disable the workspace dropdown, disable all visible Export buttons.
@@ -578,6 +680,271 @@ async function loadById() {
   }
 }
 
+// ============================================================
+//   Tab: Files by name
+// ============================================================
+
+function renderFileNameRows(rows) {
+  if (!rows.length) {
+    elFnResults.innerHTML = '<div class="empty">No files match.</div>';
+    return;
+  }
+  const parts = rows.map((r, idx) => {
+    const path = escapeHtml(r.path);
+    const basename = escapeHtml(r.basename);
+    const parent = escapeHtml(r.parent_dir || "");
+    const size = escapeHtml(fmtBytes(r.size_bytes));
+    const age = escapeHtml(relAge(r.mtime_iso));
+    const kind = escapeHtml(r.kind || "file");
+    return `
+      <div class="row" data-row-idx="${idx}" data-path="${path}">
+        <div class="row-head">
+          <span class="file-basename">${basename}</span>
+          <span class="file-kind ${kind}">${kind}</span>
+          <span class="file-size">${size}</span>
+          <span class="age">${age}</span>
+        </div>
+        <div class="file-path">${parent}/</div>
+        <div class="row-actions">
+          <button class="reveal-btn" data-path="${path}">Reveal in Finder</button>
+          <button class="copy-btn" data-path="${path}">Copy to Downloads</button>
+        </div>
+      </div>
+    `;
+  });
+  elFnResults.innerHTML = parts.join("");
+}
+
+async function loadFilesByName() {
+  const q = (elFnQ.value || "").trim();
+  if (!q) {
+    elFnResults.innerHTML = '<div class="empty">Type a filename pattern above.</div>';
+    setStatusLine(elFnStatus, null);
+    return;
+  }
+  if (inflightFnController) inflightFnController.abort();
+  const controller = new AbortController();
+  inflightFnController = controller;
+  const params = [["q", q]];
+  const scope = (elFnScope.value || "/").trim() || "/";
+  if (scope !== "/") params.push(["scope", scope]);
+  params.push(["include_hidden", elFnHidden.checked ? "true" : "false"]);
+  const url = "/api/files/by-name?" + buildQS(params);
+  setStatusLine(elFnStatus, `Searching for «${q}» under ${scope}…`, "loading");
+  elFnQ.classList.add("searching");
+  const tStart = performance.now();
+  try {
+    const data = await fetchJson(url, {signal: controller.signal});
+    const elapsed = ((performance.now() - tStart) / 1000).toFixed(2);
+    renderFileNameRows(data);
+    setStatusLine(elFnStatus, `Found ${data.length} file${data.length === 1 ? "" : "s"} in ${elapsed}s`, "ok");
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    elFnResults.innerHTML = '<div class="empty">Error: ' + escapeHtml(e.message) + "</div>";
+    setStatusLine(elFnStatus, "Search failed: " + e.message, "error");
+  } finally {
+    if (inflightFnController === controller) inflightFnController = null;
+    elFnQ.classList.remove("searching");
+  }
+}
+
+// ============================================================
+//   Tab: Files by content
+// ============================================================
+
+function renderFileContentRows(rows) {
+  if (!rows.length) {
+    elFcResults.innerHTML = '<div class="empty">No matches.</div>';
+    return;
+  }
+  const parts = rows.map((r) => {
+    const path = escapeHtml(r.path);
+    const parent = escapeHtml(r.path.replace(/[^\/]+$/, ""));
+    const basename = escapeHtml((r.path.match(/[^\/]+$/) || [""])[0]);
+    const lineNo = escapeHtml(String(r.line_number || ""));
+    const size = escapeHtml(fmtBytes(r.size_bytes));
+    const age = escapeHtml(relAge(r.mtime_iso));
+    const snippet = snippetHtml(r.match_text || "");
+    return `
+      <div class="row" data-path="${path}">
+        <div class="row-head">
+          <span class="file-basename">${basename}</span>
+          <span class="file-line">line ${lineNo}</span>
+          <span class="file-size">${size}</span>
+          <span class="age">${age}</span>
+        </div>
+        <div class="file-path">${parent}</div>
+        <div class="snippets"><div class="snippet">${snippet}</div></div>
+        <div class="row-actions">
+          <button class="reveal-btn" data-path="${path}">Reveal in Finder</button>
+          <button class="copy-btn" data-path="${path}">Copy to Downloads</button>
+        </div>
+      </div>
+    `;
+  });
+  elFcResults.innerHTML = parts.join("");
+}
+
+async function loadFilesByContent() {
+  const q = (elFcQ.value || "").trim();
+  if (!q) {
+    elFcResults.innerHTML = '<div class="empty">Type a phrase above to search file contents (ripgrep).</div>';
+    setStatusLine(elFcStatus, null);
+    return;
+  }
+  if (inflightFcController) inflightFcController.abort();
+  const controller = new AbortController();
+  inflightFcController = controller;
+  const params = [["q", q]];
+  const scope = (elFcScope.value || "/").trim() || "/";
+  if (scope !== "/") params.push(["scope", scope]);
+  params.push(["include_hidden", elFcHidden.checked ? "true" : "false"]);
+  const url = "/api/files/by-content?" + buildQS(params);
+  setStatusLine(elFcStatus, `Searching for «${q}» under ${scope}…`, "loading");
+  elFcQ.classList.add("searching");
+  const tStart = performance.now();
+  try {
+    const data = await fetchJson(url, {signal: controller.signal});
+    const elapsed = ((performance.now() - tStart) / 1000).toFixed(2);
+    renderFileContentRows(data);
+    setStatusLine(elFcStatus, `Found ${data.length} match${data.length === 1 ? "" : "es"} in ${elapsed}s`, "ok");
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    elFcResults.innerHTML = '<div class="empty">Error: ' + escapeHtml(e.message) + "</div>";
+    setStatusLine(elFcStatus, "Search failed: " + e.message, "error");
+  } finally {
+    if (inflightFcController === controller) inflightFcController = null;
+    elFcQ.classList.remove("searching");
+  }
+}
+
+// ============================================================
+//   Action handlers — Reveal / Copy (shared by both file tabs)
+// ============================================================
+
+async function handleRevealClick(btn) {
+  const path = btn.dataset.path;
+  if (!path) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Revealing…";
+  try {
+    const r = await fetchJson("/api/files/reveal", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path}),
+    });
+    if (r.ok) {
+      btn.textContent = "✓ Revealed";
+      setStatus(`Revealed ${path} in Finder.`, "ok");
+    } else {
+      throw new Error(r.error || "reveal failed");
+    }
+  } catch (e) {
+    btn.textContent = "✗ Failed";
+    setStatus("Reveal failed: " + e.message, "error");
+  } finally {
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.disabled = false;
+    }, 1200);
+  }
+}
+
+async function handleCopyClick(btn) {
+  const path = btn.dataset.path;
+  if (!path) return;
+  btn.disabled = true;
+  btn.dataset.busy = "1";
+  btn.classList.remove("ok", "err");
+  // Remove any path/error block from a previous attempt.
+  const prevPath = btn.parentElement.querySelector(".export-path");
+  if (prevPath) prevPath.remove();
+  const prevErr = btn.parentElement.querySelector(".export-err");
+  if (prevErr) prevErr.remove();
+  btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>Copying…';
+  setStatus(`Copying ${path}…`);
+  try {
+    const r = await fetchJson("/api/files/copy-to-downloads", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path}),
+    });
+    btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>Verifying…';
+    await new Promise((res) => setTimeout(res, 300));
+    if (!r.verified) throw new Error("server did not return verified=true");
+    setStatus(`Wrote ${r.copied_to} (${r.bytes} bytes, verified)`, "ok");
+    try { await navigator.clipboard.writeText(r.copied_to); } catch (_) {}
+    btn.classList.add("ok");
+    btn.textContent = "✓ Copied";
+    const pathEl = document.createElement("span");
+    pathEl.className = "export-path";
+    pathEl.textContent = r.copied_to;
+    btn.parentElement.appendChild(pathEl);
+  } catch (e) {
+    setStatus("Copy failed: " + e.message, "error");
+    btn.classList.remove("is-busy");
+    btn.classList.add("err");
+    btn.textContent = "✗ Copy failed";
+    const errEl = document.createElement("span");
+    errEl.className = "export-err";
+    errEl.textContent = e.message;
+    btn.parentElement.appendChild(errEl);
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.classList.remove("err");
+      btn.textContent = "Copy to Downloads";
+      delete btn.dataset.busy;
+      if (errEl.parentElement) errEl.remove();
+    }, 3000);
+  }
+}
+
+// Delegate clicks on both file-result lists to the action handlers.
+function wireFileResultClicks(container) {
+  container.addEventListener("click", async (ev) => {
+    const revealBtn = ev.target.closest(".reveal-btn");
+    if (revealBtn) { await handleRevealClick(revealBtn); return; }
+    const copyBtn = ev.target.closest(".copy-btn");
+    if (copyBtn) { await handleCopyClick(copyBtn); return; }
+  });
+}
+wireFileResultClicks(elFnResults);
+wireFileResultClicks(elFcResults);
+
+// ============================================================
+//   Tab switching
+// ============================================================
+
+function activateTab(name) {
+  // Buttons
+  document.querySelectorAll(".tab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === name);
+  });
+  // Panels
+  document.querySelectorAll(".tab-panel").forEach((p) => {
+    p.classList.toggle("active", p.dataset.panel === name);
+  });
+  // Persist
+  try { localStorage.setItem(ACTIVE_TAB_KEY, name); } catch (_) {}
+  // Focus the relevant input.
+  if (name === "chats") elQ.focus();
+  else if (name === "filename") elFnQ.focus();
+  else if (name === "content") elFcQ.focus();
+}
+
+document.querySelectorAll(".tab").forEach((b) => {
+  b.addEventListener("click", () => activateTab(b.dataset.tab));
+});
+
+function initActiveTab() {
+  let saved = null;
+  try { saved = localStorage.getItem(ACTIVE_TAB_KEY); } catch (_) {}
+  if (saved && ["chats", "filename", "content"].includes(saved)) {
+    activateTab(saved);
+  }
+}
+
 // Apply persisted exact-phrase toggle state and keep the placeholder in sync.
 function applyExactToggle() {
   elQ.placeholder = elExactToggle.checked ? PLACEHOLDER_EXACT : PLACEHOLDER_AND;
@@ -723,6 +1090,40 @@ elExactToggle.addEventListener("change", () => {
   loadSessions();
 });
 
+// Files-by-name tab wiring
+elFnQ.addEventListener("input", () => {
+  clearTimeout(fnDebounceTimer);
+  fnDebounceTimer = setTimeout(loadFilesByName, 300);
+});
+elFnQ.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { clearTimeout(fnDebounceTimer); loadFilesByName(); }
+});
+elFnScope.addEventListener("change", loadFilesByName);
+elFnHidden.addEventListener("change", () => { if (elFnQ.value.trim()) loadFilesByName(); });
+$("#fn-clear").addEventListener("click", () => {
+  elFnQ.value = "";
+  elFnResults.innerHTML = '<div class="empty">Type a filename pattern above.</div>';
+  setStatusLine(elFnStatus, null);
+  elFnQ.focus();
+});
+
+// Files-by-content tab wiring
+elFcQ.addEventListener("input", () => {
+  clearTimeout(fcDebounceTimer);
+  fcDebounceTimer = setTimeout(loadFilesByContent, 400);
+});
+elFcQ.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { clearTimeout(fcDebounceTimer); loadFilesByContent(); }
+});
+elFcScope.addEventListener("change", loadFilesByContent);
+elFcHidden.addEventListener("change", () => { if (elFcQ.value.trim()) loadFilesByContent(); });
+$("#fc-clear").addEventListener("click", () => {
+  elFcQ.value = "";
+  elFcResults.innerHTML = '<div class="empty">Type a phrase above to search file contents (ripgrep).</div>';
+  setStatusLine(elFcStatus, null);
+  elFcQ.focus();
+});
+
 // Perf banner (issue #2) — dismissible, sticky via localStorage.
 function initPerfBanner() {
   let dismissed = false;
@@ -737,6 +1138,7 @@ function initPerfBanner() {
 // Initial load
 initPerfBanner();
 initExactToggle();
+initActiveTab();
 loadHealth();
 loadWorkspaces();
 loadSessions();

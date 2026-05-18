@@ -241,6 +241,88 @@ def test_index_export_button_shows_path_below():
     assert "export-path" in html  # also referenced by class= in JS
 
 
+# -------- Tab strip + multi-tab UI (files-by-name, files-by-content) --------
+
+
+def test_index_contains_tab_strip():
+    html = _read_index()
+    # Three tab buttons.
+    assert 'id="tab-chats"' in html
+    assert 'id="tab-filename"' in html
+    assert 'id="tab-content"' in html
+    # Tab labels visible to operator.
+    assert "Conductor chats" in html
+    assert "Files by name" in html
+    assert "Files by content" in html
+
+
+def test_index_tab_panels_present():
+    html = _read_index()
+    assert 'data-panel="chats"' in html
+    assert 'data-panel="filename"' in html
+    assert 'data-panel="content"' in html
+    # Chats panel is the default active one.
+    assert 'class="tab-panel active" data-panel="chats"' in html
+
+
+def test_index_persists_active_tab():
+    html = _read_index()
+    assert "cchat-active-tab" in html
+    assert "initActiveTab" in html
+    assert "activateTab" in html
+
+
+def test_index_contains_files_by_name_controls():
+    html = _read_index()
+    assert 'id="fn-q"' in html
+    assert 'id="fn-scope"' in html
+    assert 'id="fn-hidden"' in html
+    assert 'id="file-name-results"' in html
+
+
+def test_index_contains_files_by_content_controls():
+    html = _read_index()
+    assert 'id="fc-q"' in html
+    assert 'id="fc-scope"' in html
+    assert 'id="fc-hidden"' in html
+    assert 'id="file-content-results"' in html
+
+
+def test_index_hits_files_endpoints():
+    html = _read_index()
+    assert "/api/files/by-name" in html
+    assert "/api/files/by-content" in html
+    assert "/api/files/copy-to-downloads" in html
+    assert "/api/files/reveal" in html
+
+
+def test_index_contains_reveal_and_copy_buttons():
+    html = _read_index()
+    # Action buttons that show on every file row.
+    assert "Reveal in Finder" in html
+    assert "Copy to Downloads" in html
+    # CSS classes used to delegate clicks.
+    assert "reveal-btn" in html
+    assert "copy-btn" in html
+
+
+def test_index_file_rows_render_file_metadata():
+    html = _read_index()
+    # Per-row helpers used in the file-row renderers.
+    assert "renderFileNameRows" in html
+    assert "renderFileContentRows" in html
+    assert "fmtBytes" in html
+
+
+def test_index_include_hidden_defaults_on():
+    html = _read_index()
+    # Both file tabs ship with the include-hidden checkbox checked.
+    # The 'checked' attribute appears on both fn-hidden and fc-hidden.
+    # (We check both inputs are marked checked.)
+    assert 'id="fn-hidden" type="checkbox" checked' in html
+    assert 'id="fc-hidden" type="checkbox" checked' in html
+
+
 # -------- live (boot the server and curl /) --------
 
 
