@@ -33,12 +33,20 @@ def list_sessions(
     con: sqlite3.Connection,
     limit: int = 500,
     account_index: dict[str, str] | None = None,
+    include_hidden: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return non-hidden sessions ordered by updated_at DESC.
+    """Return sessions ordered by updated_at DESC.
+
+    By default skips ``is_hidden=1`` rows so the unfiltered listing doesn't
+    show chats the user dismissed/archived. Pass ``include_hidden=True``
+    when the caller is running a query (search / lookup) — at that point
+    the user is actively looking for something specific and hidden chats
+    are exactly the chats they need to surface.
 
     Each dict carries: session_id, title, workspace_id, workspace_name, model,
     agent_type, created_at, updated_at, last_user_message_at,
-    context_used_percent, context_token_count, message_count, account.
+    context_used_percent, context_token_count, is_hidden, message_count,
+    account.
 
     ``account`` is the Claude Code account directory whose ``projects/`` tree
     holds the resumable JSONL for this session id, or None if no account
@@ -46,8 +54,9 @@ def list_sessions(
     Claude Code cannot resume it). When ``account_index`` is not supplied,
     the field is set to None on every row.
     """
+    where_clause = "" if include_hidden else "WHERE s.is_hidden = 0"
     rows = con.execute(
-        """
+        f"""
         SELECT s.id AS session_id,
                s.title AS title,
                s.workspace_id AS workspace_id,
@@ -59,11 +68,12 @@ def list_sessions(
                s.last_user_message_at AS last_user_message_at,
                s.context_used_percent AS context_used_percent,
                s.context_token_count AS context_token_count,
+               s.is_hidden AS is_hidden,
                (SELECT COUNT(*) FROM session_messages m WHERE m.session_id = s.id)
                    AS message_count
         FROM sessions s
         LEFT JOIN workspaces w ON w.id = s.workspace_id
-        WHERE s.is_hidden = 0
+        {where_clause}
         ORDER BY s.updated_at DESC
         LIMIT ?
         """,

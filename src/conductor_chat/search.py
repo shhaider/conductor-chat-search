@@ -132,10 +132,14 @@ def search(
     # while we're at it. When FTS provided hit message_ids we fetch only
     # those (typically a handful); otherwise we fall back to fetching all
     # messages in the session (LIKE path).
+    # When the user has typed a query, surface hidden sessions too — those
+    # are exactly the chats they've lost track of and are likely hunting for.
+    # The UI badges hidden rows so the user knows.
     all_sessions = db.list_sessions(
         con,
         limit=max(limit, len(candidate_ids)),
         account_index=account_index,
+        include_hidden=True,
     )
     session_index = {s["session_id"]: s for s in all_sessions}
 
@@ -256,13 +260,15 @@ def _candidates_via_fts(
     msg_hit_map: dict[str, set[str]] = {}
     ids = list(hit_message_ids)
     CHUNK = 800
+    # Search includes hidden sessions on purpose — when the user has typed
+    # a query, hidden chats are exactly what they're hunting for. The UI
+    # badges hidden rows so the user knows.
     if workspace_id:
         sql = (
             "SELECT m.session_id, m.id "
             "FROM session_messages m "
             "JOIN sessions s ON s.id = m.session_id "
-            "WHERE s.is_hidden = 0 "
-            "  AND s.workspace_id = ? "
+            "WHERE s.workspace_id = ? "
             "  AND m.id IN ({placeholders})"
         )
     else:
@@ -270,8 +276,7 @@ def _candidates_via_fts(
             "SELECT m.session_id, m.id "
             "FROM session_messages m "
             "JOIN sessions s ON s.id = m.session_id "
-            "WHERE s.is_hidden = 0 "
-            "  AND m.id IN ({placeholders})"
+            "WHERE m.id IN ({placeholders})"
         )
     for i in range(0, len(ids), CHUNK):
         chunk = ids[i:i + CHUNK]
@@ -301,14 +306,14 @@ def _candidates_via_like(
     when FTS5 isn't available.
     """
     pattern = f"%{_escape_like(term)}%"
+    # Search includes hidden sessions on purpose (see _candidates_via_fts).
     if workspace_id:
         rows = con.execute(
             """
             SELECT DISTINCT m.session_id
             FROM session_messages m
             JOIN sessions s ON s.id = m.session_id
-            WHERE s.is_hidden = 0
-              AND s.workspace_id = ?
+            WHERE s.workspace_id = ?
               AND m.content LIKE ? ESCAPE '\\' COLLATE NOCASE
             """,
             (workspace_id, pattern),
@@ -319,8 +324,7 @@ def _candidates_via_like(
             SELECT DISTINCT m.session_id
             FROM session_messages m
             JOIN sessions s ON s.id = m.session_id
-            WHERE s.is_hidden = 0
-              AND m.content LIKE ? ESCAPE '\\' COLLATE NOCASE
+            WHERE m.content LIKE ? ESCAPE '\\' COLLATE NOCASE
             """,
             (pattern,),
         ).fetchall()
