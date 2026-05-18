@@ -114,10 +114,17 @@ def lookup_sessions_by_id(
       - Otherwise -> prefix lookup ``id LIKE '<id_value>%'`` so that the
         operator can paste any 8+ char prefix and still land on the chat.
 
+    ID lookup INCLUDES hidden sessions on purpose. The general listing and
+    search paths skip ``is_hidden=1`` (because hidden chats clutter the
+    default view), but if the user has pasted a specific ID they explicitly
+    want THAT chat — even if Conductor has it flagged hidden. Each row
+    carries an ``is_hidden`` field so the UI can surface the state if it
+    wants to.
+
     Each dict carries the same shape as ``list_sessions`` rows:
     session_id, title, workspace_id, workspace_name, model, agent_type,
     created_at, updated_at, last_user_message_at, context_used_percent,
-    context_token_count, message_count, account.
+    context_token_count, message_count, account — plus ``is_hidden``.
 
     The caller is responsible for length validation (>=8 chars). An empty
     ``id_value`` returns an empty list without touching the DB.
@@ -155,12 +162,12 @@ def lookup_sessions_by_id(
                s.last_user_message_at AS last_user_message_at,
                s.context_used_percent AS context_used_percent,
                s.context_token_count AS context_token_count,
+               s.is_hidden AS is_hidden,
                (SELECT COUNT(*) FROM session_messages m WHERE m.session_id = s.id)
                    AS message_count
         FROM sessions s
         LEFT JOIN workspaces w ON w.id = s.workspace_id
-        WHERE s.is_hidden = 0
-          AND {where_clause}
+        WHERE {where_clause}
         ORDER BY s.updated_at DESC
         LIMIT ?
         """,

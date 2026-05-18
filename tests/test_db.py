@@ -144,14 +144,17 @@ def test_lookup_by_id_empty_value(fixture_db):
 
 
 def test_lookup_by_id_prefix_match(fixture_db):
-    """An 8+ char prefix returns every visible session whose id starts with it."""
+    """A prefix returns every session whose id starts with it (incl. hidden)."""
     con = db.open_ro(fixture_db)
     try:
         # Fixture ids are 's1', 's2', 's3'. Use 's' prefix as the lookup —
         # the function does prefix matching for any non-UUID-shaped value.
+        # Hidden sessions ARE returned by id lookup (the user explicitly
+        # asked for that ID; the row carries is_hidden so callers can show
+        # the state).
         rows = db.lookup_sessions_by_id(con, "s")
         ids = sorted(r["session_id"] for r in rows)
-        assert ids == ["s1", "s2"]  # s3 is hidden
+        assert ids == ["s1", "s2", "s3"]
     finally:
         con.close()
 
@@ -185,13 +188,21 @@ def test_lookup_by_id_exact_match_carries_row_shape(fixture_db):
         con.close()
 
 
-def test_lookup_by_id_does_not_return_hidden_sessions(fixture_db):
-    """is_hidden=1 sessions stay hidden even when the id matches exactly."""
+def test_lookup_by_id_returns_hidden_sessions_too(fixture_db):
+    """Hidden sessions are still reachable by direct ID lookup.
+
+    Rationale: a hidden chat in Conductor is one the user dismissed/archived
+    in the UI. If the operator pasted a specific ID they explicitly want
+    THAT chat — even if the hidden flag is set. The row carries
+    ``is_hidden`` so the caller can surface the state.
+    """
     con = db.open_ro(fixture_db)
     try:
         # s3 is hidden in the default fixture.
         rows = db.lookup_sessions_by_id(con, "s3")
-        assert rows == []
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "s3"
+        assert rows[0]["is_hidden"] == 1
     finally:
         con.close()
 

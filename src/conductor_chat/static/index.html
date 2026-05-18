@@ -445,6 +445,8 @@ function render(sessions, terms) {
     const mk = s.match_kind === "exact" ? "exact" : "and";
     const mkLabel = mk === "exact" ? "🎯 exact" : "🔍 and";
     const mkHtml = `<span class="badge-mk ${mk}" title="${mk === "exact" ? "Matched as a contiguous phrase" : "Matched all words (AND)"}">${mkLabel}</span>`;
+    // Hidden-flag indicator (only relevant on ID-lookup rows; search/listing already skips them).
+    const hiddenHtml = s.is_hidden ? '<span class="acct orphaned" title="This chat is hidden in Conductor (archived/dismissed). Pasted ID lookups still surface it.">(hidden)</span>' : "";
     let snippetsHtml = "";
     if (Array.isArray(s.snippets) && s.snippets.length) {
       snippetsHtml = '<div class="snippets">' + s.snippets.map((sn) =>
@@ -457,6 +459,7 @@ function render(sessions, terms) {
         <div class="row-head">
           <span class="title">${title}</span>
           ${mkHtml}
+          ${hiddenHtml}
           <span class="ws">${ws}</span>
           ${acctHtml}
           <span class="model">${model}</span>
